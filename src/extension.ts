@@ -197,6 +197,14 @@ class DeepAgentsChatPanel {
     return this.activeSession.selectedModelKey;
   }
 
+  private promoteSession(sessionId: string): void {
+    const index = this.sessions.findIndex((session) => session.id === sessionId);
+    if (index > 0) {
+      const [session] = this.sessions.splice(index, 1);
+      this.sessions.unshift(session);
+    }
+  }
+
   private async deleteSession(sessionId: string): Promise<void> {
     const index = this.sessions.findIndex((session) => session.id === sessionId);
     if (index < 0) {
@@ -294,6 +302,18 @@ class DeepAgentsChatPanel {
       return;
     }
     if (raw.type === "deleteSession" && !this.running) {
+      const session = this.sessions.find((item) => item.id === raw.sessionId);
+      if (!session) {
+        return;
+      }
+      const confirmation = await vscode.window.showWarningMessage(
+        `Permanently delete "${session.title}" and its stored conversation?`,
+        { modal: true },
+        "Delete",
+      );
+      if (confirmation !== "Delete") {
+        return;
+      }
       await this.deleteSession(raw.sessionId);
       await this.postWorkbenchState(true);
       return;
@@ -330,6 +350,8 @@ class DeepAgentsChatPanel {
       eventType: "user_message",
       payload: { schemaVersion: 1, content: prompt },
     });
+    this.promoteSession(session.id);
+    await this.postWorkbenchState(false);
     if (isFirstMessage) {
       void this.generateSessionTitle(session.id, prompt, model);
     }
@@ -1503,7 +1525,7 @@ function renderWebview(
         remove.disabled = running;
         remove.addEventListener("click", (event) => {
           event.stopPropagation();
-          if (!running && confirm('Delete "' + session.title + '"?')) {
+          if (!running) {
             vscode.postMessage({ type: "deleteSession", sessionId: session.id });
           }
         });
