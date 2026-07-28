@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { AIMessage } from "@langchain/core/messages";
+import { AIMessage, ToolMessage } from "@langchain/core/messages";
 import { Command } from "@langchain/langgraph";
 import { createDeepAgent, FilesystemBackend } from "deepagents";
 import {
@@ -14,6 +14,12 @@ import {
   type ConversationReplayItem,
 } from "./persistence/ConversationReplayProjection";
 import { CURRENT_GRAPH_COMPATIBILITY_VERSION } from "./persistence/RecoveryService";
+import {
+  classifyToolEffect,
+  createToolExecutionLedgerMiddleware,
+  encodeToolResult,
+  hashToolInput,
+} from "./toolExecutionLedger";
 
 let currentPanel: DeepAgentsChatPanel | undefined;
 const processAllowedToolsBySession = new Map<string, Set<string>>();
@@ -450,6 +456,12 @@ class DeepAgentsChatPanel {
       model: adapter,
       tools: [executeCommandTool],
       backend,
+      middleware: [
+        createToolExecutionLedgerMiddleware({
+          repository: this.persistence.toolExecutions,
+          runId,
+        }),
+      ],
       checkpointer: this.persistence.checkpointer,
       interruptOn: {
         write_file: {
@@ -498,10 +510,22 @@ class DeepAgentsChatPanel {
 
       let approvalRequest = extractApprovalRequest(result);
       while (approvalRequest) {
+        const actions = approvalRequest.actions;
         this.persistence.runs.setExecutionStatus(runId, "waiting_approval");
         await this.recordLatestCheckpoint(runId, session);
+        const approvalToolCallIds = this.matchApprovalToolCalls(
+          runId,
+          actions,
+        );
+        for (const toolCallId of approvalToolCallIds) {
+          this.persistence.toolExecutions.transition(
+            runId,
+            toolCallId,
+            "waiting_approval",
+          );
+        }
         const commandGuardError = getCommandGuardError(
-          approvalRequest.actions,
+          actions,
           this.workspaceRoot,
         );
         let decisions: Array<
@@ -510,7 +534,7 @@ class DeepAgentsChatPanel {
         >;
 
         if (commandGuardError) {
-          decisions = approvalRequest.actions.map(() => ({
+          decisions = actions.map(() => ({
             type: "reject" as const,
             message: [
               commandGuardError,
@@ -521,16 +545,17 @@ class DeepAgentsChatPanel {
           }));
         } else {
           const decision = await this.requestApproval(
-            approvalRequest.actions,
+            actions,
+            approvalToolCallIds,
             runId,
             session.id,
           );
           if (decision === "session") {
-            for (const action of approvalRequest.actions) {
+            for (const action of actions) {
               session.allowedTools.add(action.name);
             }
           }
-          decisions = approvalRequest.actions.map(() =>
+          decisions = actions.map(() =>
             decision === "deny"
               ? {
                   type: "reject" as const,
@@ -540,6 +565,36 @@ class DeepAgentsChatPanel {
           );
         }
 
+        decisions.forEach((decision, index) => {
+          const toolCallId = approvalToolCallIds[index];
+          const action = actions[index];
+          if (decision.type === "approve") {
+            if (action.name === "write_file") {
+              this.persistence.toolExecutions.setEffectClass(
+                runId,
+                toolCallId,
+                "idempotent_write",
+              );
+            }
+            this.persistence.toolExecutions.transition(
+              runId,
+              toolCallId,
+              "approved",
+            );
+          } else {
+            this.persistence.toolExecutions.transition(
+              runId,
+              toolCallId,
+              "denied",
+              encodeToolResult(new ToolMessage({
+                content: decision.message,
+                tool_call_id: toolCallId,
+                name: action.name,
+                status: "error",
+              })),
+            );
+          }
+        });
         const resume = { decisions };
         result = await agent.invoke(new Command({ resume }), runConfig);
         this.persistence.runs.setExecutionStatus(runId, "running");
@@ -590,6 +645,7 @@ class DeepAgentsChatPanel {
 
   private async requestApproval(
     actions: ApprovalAction[],
+    toolCallIds: string[],
     runId: string,
     sessionId: string,
   ): Promise<ApprovalDecision> {
@@ -609,7 +665,7 @@ class DeepAgentsChatPanel {
       actions,
       allowSession,
     });
-    for (const action of actions) {
+    actions.forEach((action, index) => {
       this.persistence.conversationEvents.append({
         sessionId,
         runId,
@@ -621,14 +677,18 @@ class DeepAgentsChatPanel {
           input: action.args,
         },
       });
-    }
+      const toolCallId = toolCallIds[index];
+      if (!toolCallId) {
+        throw new Error(`Approval action "${action.name}" has no tool call.`);
+      }
+    });
     const decision = await decisionPromise;
     await this.post({
       type: "approvalResolved",
       requestId,
       decision,
     });
-    for (const action of actions) {
+    actions.forEach((action, index) => {
       this.persistence.conversationEvents.append({
         sessionId,
         runId,
@@ -638,12 +698,39 @@ class DeepAgentsChatPanel {
       this.persistence.approvals.record({
         sessionId,
         runId,
+        toolCallId: toolCallIds[index],
         toolName: action.name,
         decision: decision === "deny" ? "deny" : decision,
         processInstanceId: this.processInstanceId,
       });
-    }
+    });
     return decision;
+  }
+
+  private matchApprovalToolCalls(
+    runId: string,
+    actions: ApprovalAction[],
+  ): string[] {
+    const used = new Set<string>();
+    return actions.map((action) => {
+      const inputHash = hashToolInput(action.args);
+      for (const [toolCallId, toolCall] of this.toolCalls) {
+        if (
+          !used.has(toolCallId) &&
+          toolCall.name === action.name &&
+          hashToolInput(toolCall.input) === inputHash
+        ) {
+          const record = this.persistence.toolExecutions.get(runId, toolCallId);
+          if (record && record.inputHash === inputHash) {
+            used.add(toolCallId);
+            return toolCallId;
+          }
+        }
+      }
+      throw new Error(
+        `Could not correlate approval action "${action.name}" with a durable tool call.`,
+      );
+    });
   }
 
   private async recordLatestCheckpoint(
@@ -781,6 +868,14 @@ class DeepAgentsChatPanel {
     } else if (event.kind === "toolCall") {
       const input = toRecord(event.input);
       this.toolCalls.set(event.id, { name: event.name, input });
+      this.persistence.toolExecutions.request({
+        runId,
+        toolCallId: event.id,
+        toolName: event.name,
+        arguments: input,
+        inputHash: hashToolInput(input),
+        effectClass: classifyToolEffect(event.name),
+      });
       this.persistence.conversationEvents.append({
         sessionId,
         runId,

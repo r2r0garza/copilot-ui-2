@@ -13,7 +13,8 @@
 - [x] Plan 04.1 — production turns use the shared durable checkpointer, stable thread IDs, and incremental input.
 - [x] Plan 04.2 — a deterministic fresh-process test resumes an interrupted durable graph without rerunning completed steps and verifies typed checkpoint recovery errors.
 - [x] Plan 05.1 — run leases and heartbeats, startup recovery classification, session-scoped recovery cards, and durable side-effect reconciliation decisions.
-- [ ] Plans 05.2–06 — tool ledger execution integration, restart-expiring approval authority, future-goal fixtures, and operational hardening.
+- [x] Plan 05.2 — exact tool-call ledger integration, durable terminal replay, input-integrity enforcement, effect classification, and uncertain-execution blocking.
+- [ ] Plans 05.3–06 — restart-expiring approval authority, future-goal fixtures, and operational hardening.
 
 ## Objective
 
@@ -952,7 +953,7 @@ Resolved evidence gates:
 Remaining evidence gates:
 
 1. What exact Deep Agents/LangGraph invocation resumes a non-HITL interrupted run in the installed versions? Lock it with an integration test.
-2. Can current built-in file tools be wrapped with a durable ledger cleanly, or must recovery conservatively classify an interrupted write/edit as `needs_review`?
+2. Resolved: current built-in file tools are wrapped through LangChain tool-call middleware. Terminal `ToolMessage` and `Command` results are reconstructed durably; interrupted writes/edits remain conservatively classified `needs_review`.
 3. What compatibility versioning is required when Deep Agents upgrades its state schema?
 
 ## Completion Criteria

@@ -83,6 +83,7 @@ export class RecoveryService {
         run.lastError ?? "This run is blocked from continuation.",
       );
     }
+    this.tools.authorizeReadOnlyRetries(run.id);
     return run;
   }
 
