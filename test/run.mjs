@@ -4,8 +4,16 @@ import { spawnSync } from "node:child_process";
 const tests = [
   "adapter.integration",
   "approval.integration",
+  "conversationReplayProjection.test",
   "executeCommandTool.test",
   "command.integration",
+  "sqliteCheckpointer.integration",
+  "toolExecutionLedger.integration",
+  "pendingApprovalRecovery.integration",
+  "interruptedContinuation.integration",
+  "persistenceService.integration",
+  "recovery.integration",
+  "repositories.integration",
 ];
 
 await esbuild.build({
