@@ -52,7 +52,8 @@ The persistence layer is an execution substrate, not merely chat-history storage
 
 - LangGraph requires a checkpointer plus a stable `configurable.thread_id`; checkpoints are written at graph step boundaries and allow interrupted work to resume from stored state.
 - The official JavaScript SQLite implementation is `@langchain/langgraph-checkpoint-sqlite`, whose `SqliteSaver` stores `checkpoints` and pending `writes`.
-- The current SQLite saver depends on native `better-sqlite3`, so VS Code/Electron ABI packaging must be proven before the dependency is locked in.
+- The official saver depends on native `better-sqlite3`. The implementation spike rejected it for this extension because the addon is coupled to Electron/Node ABI and platform signing constraints across the supported VS Code range.
+- The selected implementation is a small `BaseCheckpointSaver` backed by the Extension Host's built-in `node:sqlite` `DatabaseSync`. VS Code 1.105 uses Node 22, where `node:sqlite` is available without a runtime flag, and later supported desktop releases continue to provide it.
 - Deep Agents accepts both `checkpointer` and `store` options.
 - Deep Agents’ `write_todos` state currently contains `{ content, status }`, where status is `pending`, `in_progress`, or `completed`. It does not expose a stable todo ID.
 - LangGraph resumes at node boundaries. A node containing an external side effect can run again after interruption, so resumability alone does not guarantee exactly-once effects.
@@ -148,9 +149,64 @@ The database service configures:
 - `PRAGMA journal_mode = WAL`
 - `PRAGMA foreign_keys = ON`
 - `PRAGMA busy_timeout = 5000`
-- A documented `synchronous` setting selected during the SQLite packaging spike
+- `PRAGMA synchronous = FULL`
 
 Every schema change is an ordered migration executed transactionally. Startup aborts persistence initialization on a failed or unknown migration rather than silently resetting data.
+
+The implementation spike selected `FULL` because local agent checkpoints and side-effect ledgers favor committed-state durability over the small write-throughput gain of `NORMAL`. This can be revisited only with an explicit benchmark and crash-durability test.
+
+### D-10: Desktop platform support is a release gate
+
+The persistence implementation supports desktop VS Code on:
+
+- macOS
+- Windows
+- Linux
+
+The native SQLite approach is accepted only after the Extension Host and packaged VSIX checks pass on all three platforms. A successful current-platform spike is not sufficient to narrow the declared support matrix.
+
+### D-11: Uncertain side effects require explicit reconciliation
+
+When recovery finds a non-read-only tool execution whose durable outcome is unknown, the run is classified `needs_review` and the UI offers:
+
+- `Mark completed`: record that the user verified the side effect completed, without executing it again.
+- `Retry`: execute again only after a warning that the original operation may already have completed.
+- `Abandon run`: stop recovery and leave the audit trail intact.
+
+No `needs_review` action is selected automatically. Each reconciliation decision is persisted before the graph is allowed to continue.
+
+### D-12: Delete and clear have distinct retention semantics
+
+Deleting a session permanently removes its:
+
+- Conversation events.
+- LangGraph checkpoints and pending writes.
+- Runs and attempts.
+- Tool-execution records.
+- Approval decisions and audit records.
+
+The session remains in `deleting` state until checkpoint cleanup succeeds, then all application-owned rows for that session are hard-deleted.
+
+Clearing a session preserves its identity, title, selected model, and approval audit. It removes visible conversation activity, rotates to a fresh `thread_id`, and queues the old LangGraph thread for cleanup. Process-scoped approval authority still expires on Extension Host restart as defined by D-08.
+
+### D-13: Recovery is surfaced in the originating chat
+
+Interrupted chat runs appear in the originating session, alongside its restored activity, with the action appropriate to their recovery class. This phase does not add a separate recovery dashboard.
+
+Future durable-goal runs may be presented in a cross-session or cross-workspace dashboard in a later phase; the persistence schema must not require that UI now.
+
+### D-14: Use the Extension Host's built-in SQLite runtime
+
+Implement the LangGraph checkpointer against `node:sqlite` and the public `BaseCheckpointSaver` contract. Do not ship `better-sqlite3` or another Electron-ABI-specific native addon.
+
+The saver must retain the official SQLite checkpointer's table contract and behavior:
+
+- `checkpoints` and pending `writes` remain LangGraph-owned.
+- Stable `thread_id`, `checkpoint_ns`, checkpoint listing, pending writes, and `deleteThread` are supported.
+- File-backed state is proven across fresh processes.
+- Compatibility with the installed `@langchain/langgraph-checkpoint` version is covered by integration tests.
+
+If a future Node/VS Code release changes `node:sqlite`, treat that as a compatibility migration rather than silently falling back to in-memory state.
 
 ## Proposed Data Model
 
@@ -406,6 +462,7 @@ Target behavior:
 6. Deleting a session marks it `deleting` and enqueues its thread for checkpoint cleanup. After `checkpointer.deleteThread(thread_id)` succeeds, application rows are hard-deleted. Startup retries unfinished cleanup.
 7. Clearing a session rotates it to a new `thread_id`, deletes its visible events, and queues the old thread for cleanup. This makes the cleared chat immediately fresh even if old-checkpoint cleanup must be retried.
 8. Closing the panel does not close the database. Extension deactivation closes it.
+9. Startup recovery attaches interrupted chat runs to their originating sessions. `needs_review` runs expose explicit reconciliation actions; no separate recovery dashboard is introduced in this phase.
 
 ## Implementation Plans
 
@@ -431,7 +488,7 @@ Target behavior:
 - Verify its `better-sqlite3` native dependency can load in:
   - The current Extension Development Host.
   - A packaged VSIX for the current platform.
-  - Windows and Linux CI or equivalent target builds.
+  - macOS, Windows, and Linux CI or equivalent target builds.
 - Keep the native module external to the esbuild bundle and copy/package it intentionally.
 - Record the exact rebuild/packaging command and supported target matrix.
 - If the official saver cannot meet the packaging matrix, stop at a decision gate and compare:
@@ -439,6 +496,7 @@ Target behavior:
   - A maintained non-native or WASM SQLite implementation.
   - Target-specific VSIX packages containing rebuilt `better-sqlite3`.
 - Do not proceed with a custom saver merely to avoid documenting packaging.
+- Record the spike outcome: native packaging was rejected after ABI/signing analysis, and implement the selected `node:sqlite` saver against `BaseCheckpointSaver`.
 
 </action>
 
@@ -446,8 +504,8 @@ Target behavior:
 
 - A file-backed checkpoint survives Extension Host reload.
 - The same `thread_id` retrieves its latest checkpoint.
-- The produced VSIX contains the required SQLite runtime.
-- The extension activates without `NODE_MODULE_VERSION` or native-binding errors on every declared platform.
+- The produced VSIX relies only on the SQLite runtime built into the supported Extension Host and contains no `.node` addon.
+- The extension activates without `NODE_MODULE_VERSION`, native-binding, or addon-signing errors on macOS, Windows, and Linux.
 - The selected driver and packaging approach are documented in this plan or a colocated decision note.
 
 </acceptance_criteria>
@@ -542,6 +600,7 @@ Target behavior:
 - Persist new, select, rename, delete, clear, and model-change operations.
 - Preserve generated-title/manual-title precedence with `title_source`.
 - Make “Clear” rotate `thread_id`, delete conversation events, and queue the old LangGraph thread for cleanup while retaining session identity and approval audit.
+- Make “Delete” retain the session in `deleting` state until checkpoint cleanup succeeds, then permanently remove all session-owned application data, including approval audit.
 - Keep session list rendering behavior unchanged from the user’s perspective.
 
 </action>
@@ -550,7 +609,8 @@ Target behavior:
 
 - Create two chats, add messages, rename one, switch models, reload the Extension Host, and observe the same list/order/title/model/transcripts.
 - Deleting a chat hides it immediately, completes queued checkpoint deletion, and removes it after reload.
-- Clearing a chat yields an empty transcript after reload and starts a fresh graph state.
+- Deleting a chat leaves no conversation, run, tool-execution, or approval-audit rows after cleanup.
+- Clearing a chat yields an empty transcript after reload, preserves title/model/audit, and starts a fresh graph state.
 - A title-generation response cannot overwrite a manual rename.
 
 </acceptance_criteria>
@@ -672,7 +732,8 @@ Target behavior:
 - Create/renew an attempt lease while a run is active.
 - On activation, mark expired active attempts interrupted.
 - Classify recovery using checkpoint presence, pending interrupts, compatibility version, and tool-execution state.
-- Expose recoverable items to the panel state, initially with an explicit Resume action.
+- Expose interrupted chat runs in their originating session with actions appropriate to `recovery_class`.
+- For `needs_review`, provide `Mark completed`, warned `Retry`, and `Abandon run` actions and persist the reconciliation decision before continuation.
 - Do not auto-resume in this phase.
 
 </action>
@@ -683,6 +744,8 @@ Target behavior:
 - Pending approval is classified `waiting_for_approval`.
 - A checkpoint with no uncertain side effect is `safe_to_resume`.
 - A non-read-only `running` tool row is `needs_review`.
+- A `needs_review` run cannot continue until an explicit reconciliation decision is durably recorded.
+- `Mark completed` does not execute the tool again; `Retry` warns about possible duplicate effects; `Abandon run` preserves the audit trail.
 - Missing/incompatible checkpoints are `not_resumable` with a user-facing reason.
 
 </acceptance_criteria>
@@ -819,8 +882,9 @@ Target behavior:
 | Crash during LLM request before checkpoint | Run becomes interrupted; resume classification is explicit |
 | Crash at pending approval | Approval is shown again; tool is not executed |
 | Crash before a read-only tool result | Eligible for explicit retry |
-| Crash while command/edit status is `running` | Marked uncertain; no automatic retry |
-| Delete session | App rows and checkpoint thread are removed |
+| Crash while command/edit status is `running` | Marked uncertain; user must mark completed, retry with warning, or abandon |
+| Delete session | Checkpoint thread and all session-owned app/audit rows are permanently removed |
+| Clear session | Transcript and graph state are removed; session identity, title, model, and audit remain |
 | Migration failure | Transaction rolls back; original DB remains |
 | Laptop/network interruption | On next workspace activation, stale attempt is detected and recoverable state is surfaced |
 
@@ -867,15 +931,18 @@ Exact names can be adjusted during Plan 01’s driver decision, but responsibili
 - Restart and migration integration test suites
 - Packaging/rebuild script for the selected SQLite driver
 
-## Open Decisions for the Implementation Spike
+## Implementation Spike Decisions
 
-These are evidence gates, not unanswered product requirements:
+Resolved evidence gates:
 
-1. Can the official `better-sqlite3` saver be packaged reliably for the supported VS Code targets?
-2. Which `synchronous` policy provides the desired durability/performance balance for local agent work?
-3. What exact Deep Agents/LangGraph invocation resumes a non-HITL interrupted run in the installed versions? Lock it with an integration test.
-4. Can current built-in file tools be wrapped with a durable ledger cleanly, or must recovery conservatively classify an interrupted write/edit as `needs_review`?
-5. What compatibility versioning is required when Deep Agents upgrades its state schema?
+1. The official `better-sqlite3` saver is not the shipping driver. Electron/Node ABI churn and native-addon signing make a single broadly compatible VSIX unreliable. D-14 selects `node:sqlite`.
+2. `PRAGMA synchronous = FULL` is the initial durability policy. Integration tests assert the complete PRAGMA set.
+
+Remaining evidence gates:
+
+1. What exact Deep Agents/LangGraph invocation resumes a non-HITL interrupted run in the installed versions? Lock it with an integration test.
+2. Can current built-in file tools be wrapped with a durable ledger cleanly, or must recovery conservatively classify an interrupted write/edit as `needs_review`?
+3. What compatibility versioning is required when Deep Agents upgrades its state schema?
 
 ## Completion Criteria
 

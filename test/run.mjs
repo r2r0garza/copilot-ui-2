@@ -6,6 +6,7 @@ const tests = [
   "approval.integration",
   "executeCommandTool.test",
   "command.integration",
+  "sqliteCheckpointer.integration",
 ];
 
 await esbuild.build({
