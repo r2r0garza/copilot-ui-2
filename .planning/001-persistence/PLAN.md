@@ -14,7 +14,8 @@
 - [x] Plan 04.2 — a deterministic fresh-process test resumes an interrupted durable graph without rerunning completed steps and verifies typed checkpoint recovery errors.
 - [x] Plan 05.1 — run leases and heartbeats, startup recovery classification, session-scoped recovery cards, and durable side-effect reconciliation decisions.
 - [x] Plan 05.2 — exact tool-call ledger integration, durable terminal replay, input-integrity enforcement, effect classification, and uncertain-execution blocking.
-- [ ] Plans 05.3–06 — restart-expiring approval authority, future-goal fixtures, and operational hardening.
+- [x] Plan 05.3 — process-scoped session grants, inert approval audit replay, and fresh-process continuation of checkpointed pending approvals.
+- [ ] Plan 06 — future-goal fixtures and operational hardening.
 
 ## Objective
 

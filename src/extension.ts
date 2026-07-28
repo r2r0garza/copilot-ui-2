@@ -22,9 +22,21 @@ import {
 } from "./toolExecutionLedger";
 
 let currentPanel: DeepAgentsChatPanel | undefined;
-const processAllowedToolsBySession = new Map<string, Set<string>>();
+const processAllowedTools = new Map<string, Set<string>>();
 const RUN_LEASE_MS = 30_000;
 const RUN_HEARTBEAT_MS = 10_000;
+const AGENT_SYSTEM_PROMPT = [
+  "You are a coding agent running inside VS Code.",
+  "The virtual filesystem root / is the current VS Code workspace.",
+  "Use your filesystem, planning, and execute_command tools when they help answer the user.",
+  "Inspect before editing, keep changes scoped, and clearly summarize any files changed.",
+  "File writes and edits require user approval unless allowed for this chat session.",
+  "execute_command requires user approval unless allowed for this chat session. Pass an executable and argument array; shell syntax is not interpreted.",
+  "When a tool requires approval, call it immediately. Never ask for permission in conversational text; the host application owns the approval interaction.",
+  "Never use '..', '~', home-directory variables, or absolute paths outside the workspace in command arguments; they are rejected.",
+  "For commands targeting the workspace root, omit the path argument or use '.' exactly. After a path guard rejection, do not try alternate forms such as /, /root, ~, or environment variables. Retry at most once with '.' or no path; if that cannot satisfy the request, explain the restriction and stop.",
+  "When the user requests command output, include the relevant stdout or stderr in your final response instead of only saying the command ran.",
+].join("\n");
 
 export function activate(context: vscode.ExtensionContext): void {
   let persistence: PersistenceService | undefined;
@@ -155,9 +167,13 @@ class DeepAgentsChatPanel {
     this.models = models;
     this.persistence = persistence;
     this.processInstanceId = processInstanceId;
-    this.sessions.push(...loadSessions(persistence, modelKey(models[0])));
+    this.sessions.push(
+      ...loadSessions(persistence, modelKey(models[0]), processInstanceId),
+    );
     if (this.sessions.length === 0) {
-      this.sessions.push(createSession(persistence, modelKey(models[0])));
+      this.sessions.push(
+        createSession(persistence, modelKey(models[0]), processInstanceId),
+      );
     }
     const initialSession = this.sessions[0];
     this.currentSessionId = initialSession.id;
@@ -228,7 +244,9 @@ class DeepAgentsChatPanel {
       return;
     }
     const [deleted] = this.sessions.splice(index, 1);
-    processAllowedToolsBySession.delete(sessionId);
+    processAllowedTools.delete(
+      processApprovalGrantKey(this.processInstanceId, sessionId),
+    );
     this.persistence.sessions.markDeletingAndQueue(sessionId);
     try {
       await this.persistence.checkpointer.deleteThread(deleted.threadId);
@@ -243,7 +261,11 @@ class DeepAgentsChatPanel {
     }
     if (this.sessions.length === 0) {
       this.sessions.push(
-        createSession(this.persistence, modelKey(this.models[0])),
+        createSession(
+          this.persistence,
+          modelKey(this.models[0]),
+          this.processInstanceId,
+        ),
       );
     }
     if (this.currentSessionId === sessionId) {
@@ -271,6 +293,10 @@ class DeepAgentsChatPanel {
         }
         this.resolvePendingApproval(raw.decision);
       }
+      return;
+    }
+    if (raw.type === "resumePendingApproval" && !this.running) {
+      await this.resumePendingApproval(raw.runId);
       return;
     }
     if (raw.type === "reconcileRecovery" && !this.running) {
@@ -331,6 +357,7 @@ class DeepAgentsChatPanel {
       const session = createSession(
         this.persistence,
         this.activeSession.selectedModelKey,
+        this.processInstanceId,
       );
       this.sessions.unshift(session);
       this.currentSessionId = session.id;
@@ -444,56 +471,7 @@ class DeepAgentsChatPanel {
       },
     });
 
-    const backend = new FilesystemBackend({
-      rootDir: this.workspaceRoot,
-      virtualMode: true,
-    });
-    const executeCommandTool = createExecuteCommandTool({
-      workspaceRoot: this.workspaceRoot,
-    });
-
-    const agent = createDeepAgent({
-      model: adapter,
-      tools: [executeCommandTool],
-      backend,
-      middleware: [
-        createToolExecutionLedgerMiddleware({
-          repository: this.persistence.toolExecutions,
-          runId,
-        }),
-      ],
-      checkpointer: this.persistence.checkpointer,
-      interruptOn: {
-        write_file: {
-          allowedDecisions: ["approve", "reject"],
-          description: "Review the proposed file creation before it is applied.",
-          when: ({ toolCall }) => !session.allowedTools.has(toolCall.name),
-        },
-        edit_file: {
-          allowedDecisions: ["approve", "reject"],
-          description: "Review the proposed file edit before it is applied.",
-          when: ({ toolCall }) => !session.allowedTools.has(toolCall.name),
-        },
-        execute_command: {
-          allowedDecisions: ["approve", "reject"],
-          description:
-            "Review this command carefully. It runs directly on the host in the current workspace.",
-          when: ({ toolCall }) => !session.allowedTools.has(toolCall.name),
-        },
-      },
-      systemPrompt: [
-        "You are a coding agent running inside VS Code.",
-        "The virtual filesystem root / is the current VS Code workspace.",
-        "Use your filesystem, planning, and execute_command tools when they help answer the user.",
-        "Inspect before editing, keep changes scoped, and clearly summarize any files changed.",
-        "File writes and edits require user approval unless allowed for this chat session.",
-        "execute_command requires user approval unless allowed for this chat session. Pass an executable and argument array; shell syntax is not interpreted.",
-        "When a tool requires approval, call it immediately. Never ask for permission in conversational text; the host application owns the approval interaction.",
-        "Never use '..', '~', home-directory variables, or absolute paths outside the workspace in command arguments; they are rejected.",
-        "For commands targeting the workspace root, omit the path argument or use '.' exactly. After a path guard rejection, do not try alternate forms such as /, /root, ~, or environment variables. Retry at most once with '.' or no path; if that cannot satisfy the request, explain the restriction and stop.",
-        "When the user requests command output, include the relevant stdout or stderr in your final response instead of only saying the command ran.",
-      ].join("\n"),
-    });
+    const agent = this.createAgent(adapter, session, runId);
 
     try {
       const runConfig = {
@@ -511,90 +489,11 @@ class DeepAgentsChatPanel {
       let approvalRequest = extractApprovalRequest(result);
       while (approvalRequest) {
         const actions = approvalRequest.actions;
-        this.persistence.runs.setExecutionStatus(runId, "waiting_approval");
-        await this.recordLatestCheckpoint(runId, session);
-        const approvalToolCallIds = this.matchApprovalToolCalls(
+        const decisions = await this.reviewApprovalActions(
+          actions,
           runId,
-          actions,
+          session,
         );
-        for (const toolCallId of approvalToolCallIds) {
-          this.persistence.toolExecutions.transition(
-            runId,
-            toolCallId,
-            "waiting_approval",
-          );
-        }
-        const commandGuardError = getCommandGuardError(
-          actions,
-          this.workspaceRoot,
-        );
-        let decisions: Array<
-          | { type: "approve" }
-          | { type: "reject"; message: string }
-        >;
-
-        if (commandGuardError) {
-          decisions = actions.map(() => ({
-            type: "reject" as const,
-            message: [
-              commandGuardError,
-              "Do not retry with another outside-path representation such as /, /root, ~, $HOME, or an absolute home path.",
-              "If operating on the workspace is acceptable, retry at most once with the path argument omitted or with '.' exactly.",
-              "Otherwise, explain that the requested path is outside the allowed workspace and stop.",
-            ].join(" "),
-          }));
-        } else {
-          const decision = await this.requestApproval(
-            actions,
-            approvalToolCallIds,
-            runId,
-            session.id,
-          );
-          if (decision === "session") {
-            for (const action of actions) {
-              session.allowedTools.add(action.name);
-            }
-          }
-          decisions = actions.map(() =>
-            decision === "deny"
-              ? {
-                  type: "reject" as const,
-                  message: "The user denied this tool operation for now.",
-                }
-              : { type: "approve" as const },
-          );
-        }
-
-        decisions.forEach((decision, index) => {
-          const toolCallId = approvalToolCallIds[index];
-          const action = actions[index];
-          if (decision.type === "approve") {
-            if (action.name === "write_file") {
-              this.persistence.toolExecutions.setEffectClass(
-                runId,
-                toolCallId,
-                "idempotent_write",
-              );
-            }
-            this.persistence.toolExecutions.transition(
-              runId,
-              toolCallId,
-              "approved",
-            );
-          } else {
-            this.persistence.toolExecutions.transition(
-              runId,
-              toolCallId,
-              "denied",
-              encodeToolResult(new ToolMessage({
-                content: decision.message,
-                tool_call_id: toolCallId,
-                name: action.name,
-                status: "error",
-              })),
-            );
-          }
-        });
         const resume = { decisions };
         result = await agent.invoke(new Command({ resume }), runConfig);
         this.persistence.runs.setExecutionStatus(runId, "running");
@@ -643,13 +542,314 @@ class DeepAgentsChatPanel {
     }
   }
 
+  private async resumePendingApproval(runId: string): Promise<void> {
+    const session = this.activeSession;
+    const recovery = this.persistence.recovery
+      .listForSession(session.id)
+      .find((item) => item.run.id === runId);
+    if (!recovery || recovery.recoveryClass !== "waiting_for_approval") {
+      return;
+    }
+
+    this.running = true;
+    this.cancellation = new AbortController();
+    this.toolCalls.clear();
+    let attemptId: string | undefined;
+    let heartbeat: NodeJS.Timeout | undefined;
+    try {
+      const interrupts = await this.persistence.recovery.getPendingInterrupts(
+        runId,
+      );
+      const approvalRequest = extractApprovalRequest({
+        __interrupt__: interrupts,
+      });
+      if (!approvalRequest) {
+        throw new Error(
+          "The persisted checkpoint does not contain a valid approval request.",
+        );
+      }
+
+      const resumed = this.persistence.runs.resume({
+        runId,
+        processInstanceId: this.processInstanceId,
+        leaseExpiresAt: leaseExpiration(),
+        allowedRecoveryClasses: ["waiting_for_approval"],
+      });
+      attemptId = resumed.attemptId;
+      heartbeat = setInterval(() => {
+        try {
+          this.persistence.runs.heartbeat(
+            resumed.attemptId,
+            leaseExpiration(),
+          );
+        } catch {
+          this.cancellation?.abort();
+        }
+      }, RUN_HEARTBEAT_MS);
+      heartbeat.unref();
+
+      for (const toolCall of this.persistence.toolExecutions.list(runId)) {
+        this.toolCalls.set(toolCall.toolCallId, {
+          name: toolCall.toolName,
+          input:
+            toolCall.arguments && typeof toolCall.arguments === "object"
+              ? toRecord(toolCall.arguments)
+              : {},
+        });
+      }
+
+      const model =
+        this.models.find(
+          (candidate) => modelKey(candidate) === resumed.run.modelKey,
+        ) ?? this.selectedModel;
+      let streamedFinalText = "";
+      const adapter = new VsCodeChatModel({
+        model,
+        onEvent: (event) => {
+          if (event.kind === "text") {
+            streamedFinalText += event.text;
+          }
+          void this.postAdapterEvent(event, runId, session.id);
+        },
+      });
+      const agent = this.createAgent(adapter, session, runId);
+      const runConfig = {
+        configurable: {
+          thread_id: resumed.run.threadId,
+          checkpoint_ns: resumed.run.checkpointNamespace,
+        },
+        signal: this.cancellation.signal,
+      };
+
+      await this.post({ type: "runStarted" });
+      const restoredRequestId = this.findPendingApprovalRequestId(
+        session.id,
+        runId,
+      );
+      const decisions = await this.reviewApprovalActions(
+        approvalRequest.actions,
+        runId,
+        session,
+        restoredRequestId
+          ? { requestId: restoredRequestId, recordRequest: false }
+          : {},
+      );
+      let result = await agent.invoke(
+        new Command({ resume: { decisions } }),
+        runConfig,
+      );
+      this.persistence.runs.setExecutionStatus(runId, "running");
+      await this.recordLatestCheckpoint(runId, session);
+
+      let nextApproval = extractApprovalRequest(result);
+      while (nextApproval) {
+        const nextDecisions = await this.reviewApprovalActions(
+          nextApproval.actions,
+          runId,
+          session,
+        );
+        result = await agent.invoke(
+          new Command({ resume: { decisions: nextDecisions } }),
+          runConfig,
+        );
+        this.persistence.runs.setExecutionStatus(runId, "running");
+        await this.recordLatestCheckpoint(runId, session);
+        nextApproval = extractApprovalRequest(result);
+      }
+
+      const messages = result.messages ?? [];
+      const finalMessage = [...messages]
+        .reverse()
+        .find((message) => AIMessage.isInstance(message));
+      const finalText = finalMessage
+        ? messageText(finalMessage.content)
+        : streamedFinalText;
+      session.transcript.push({ role: "assistant", content: finalText });
+      this.persistence.conversationEvents.append({
+        sessionId: session.id,
+        runId,
+        eventType: "assistant_message",
+        payload: { schemaVersion: 1, content: finalText },
+      });
+      this.persistence.runs.finish(
+        runId,
+        resumed.attemptId,
+        "completed",
+      );
+      await this.post({ type: "runCompleted", text: finalText });
+      await this.postWorkbenchState(true);
+    } catch (error) {
+      const cancelled = this.cancellation.signal.aborted;
+      const message = cancelled ? "Cancelled." : formatError(error);
+      if (attemptId) {
+        session.transcript.push({ role: "assistant", content: message });
+        this.persistence.conversationEvents.append({
+          sessionId: session.id,
+          runId,
+          eventType: cancelled ? "run_cancelled" : "run_error",
+          payload: cancelled
+            ? { schemaVersion: 1, reason: message }
+            : { schemaVersion: 1, message },
+        });
+        this.persistence.runs.finish(
+          runId,
+          attemptId,
+          cancelled ? "cancelled" : "failed",
+          message,
+        );
+      }
+      await this.post({ type: "runFailed", message });
+      await this.postWorkbenchState(true);
+    } finally {
+      if (heartbeat) {
+        clearInterval(heartbeat);
+      }
+      this.running = false;
+      this.cancellation = undefined;
+    }
+  }
+
+  private createAgent(
+    adapter: VsCodeChatModel,
+    session: ChatSession,
+    runId: string,
+  ) {
+    return createDeepAgent({
+      model: adapter,
+      tools: [
+        createExecuteCommandTool({
+          workspaceRoot: this.workspaceRoot,
+        }),
+      ],
+      backend: new FilesystemBackend({
+        rootDir: this.workspaceRoot,
+        virtualMode: true,
+      }),
+      middleware: [
+        createToolExecutionLedgerMiddleware({
+          repository: this.persistence.toolExecutions,
+          runId,
+        }),
+      ],
+      checkpointer: this.persistence.checkpointer,
+      interruptOn: {
+        write_file: {
+          allowedDecisions: ["approve", "reject"],
+          description: "Review the proposed file creation before it is applied.",
+          when: ({ toolCall }) => !session.allowedTools.has(toolCall.name),
+        },
+        edit_file: {
+          allowedDecisions: ["approve", "reject"],
+          description: "Review the proposed file edit before it is applied.",
+          when: ({ toolCall }) => !session.allowedTools.has(toolCall.name),
+        },
+        execute_command: {
+          allowedDecisions: ["approve", "reject"],
+          description:
+            "Review this command carefully. It runs directly on the host in the current workspace.",
+          when: ({ toolCall }) => !session.allowedTools.has(toolCall.name),
+        },
+      },
+      systemPrompt: AGENT_SYSTEM_PROMPT,
+    });
+  }
+
+  private async reviewApprovalActions(
+    actions: ApprovalAction[],
+    runId: string,
+    session: ChatSession,
+    presentation: ApprovalPresentation = {},
+  ): Promise<GraphApprovalDecision[]> {
+    this.persistence.runs.setExecutionStatus(runId, "waiting_approval");
+    await this.recordLatestCheckpoint(runId, session);
+    const approvalToolCallIds = this.matchApprovalToolCalls(runId, actions);
+    for (const toolCallId of approvalToolCallIds) {
+      this.persistence.toolExecutions.transition(
+        runId,
+        toolCallId,
+        "waiting_approval",
+      );
+    }
+
+    const commandGuardError = getCommandGuardError(
+      actions,
+      this.workspaceRoot,
+    );
+    let decisions: GraphApprovalDecision[];
+    if (commandGuardError) {
+      decisions = actions.map(() => ({
+        type: "reject" as const,
+        message: [
+          commandGuardError,
+          "Do not retry with another outside-path representation such as /, /root, ~, $HOME, or an absolute home path.",
+          "If operating on the workspace is acceptable, retry at most once with the path argument omitted or with '.' exactly.",
+          "Otherwise, explain that the requested path is outside the allowed workspace and stop.",
+        ].join(" "),
+      }));
+    } else {
+      const decision = await this.requestApproval(
+        actions,
+        approvalToolCallIds,
+        runId,
+        session.id,
+        presentation,
+      );
+      if (decision === "session") {
+        for (const action of actions) {
+          session.allowedTools.add(action.name);
+        }
+      }
+      decisions = actions.map(() =>
+        decision === "deny"
+          ? {
+              type: "reject" as const,
+              message: "The user denied this tool operation for now.",
+            }
+          : { type: "approve" as const },
+      );
+    }
+
+    decisions.forEach((decision, index) => {
+      const toolCallId = approvalToolCallIds[index];
+      const action = actions[index];
+      if (decision.type === "approve") {
+        if (action.name === "write_file") {
+          this.persistence.toolExecutions.setEffectClass(
+            runId,
+            toolCallId,
+            "idempotent_write",
+          );
+        }
+        this.persistence.toolExecutions.transition(
+          runId,
+          toolCallId,
+          "approved",
+        );
+      } else {
+        this.persistence.toolExecutions.transition(
+          runId,
+          toolCallId,
+          "denied",
+          encodeToolResult(new ToolMessage({
+            content: decision.message,
+            tool_call_id: toolCallId,
+            name: action.name,
+            status: "error",
+          })),
+        );
+      }
+    });
+    return decisions;
+  }
+
   private async requestApproval(
     actions: ApprovalAction[],
     toolCallIds: string[],
     runId: string,
     sessionId: string,
+    presentation: ApprovalPresentation = {},
   ): Promise<ApprovalDecision> {
-    const requestId = crypto.randomUUID();
+    const requestId = presentation.requestId ?? crypto.randomUUID();
     const allowSession = actions.every(
       (action) =>
         action.name === "write_file" ||
@@ -666,19 +866,20 @@ class DeepAgentsChatPanel {
       allowSession,
     });
     actions.forEach((action, index) => {
-      this.persistence.conversationEvents.append({
-        sessionId,
-        runId,
-        eventType: "approval_requested",
-        payload: {
-          schemaVersion: 1,
-          requestId,
-          toolName: action.name,
-          input: action.args,
-        },
-      });
-      const toolCallId = toolCallIds[index];
-      if (!toolCallId) {
+      if (presentation.recordRequest !== false) {
+        this.persistence.conversationEvents.append({
+          sessionId,
+          runId,
+          eventType: "approval_requested",
+          payload: {
+            schemaVersion: 1,
+            requestId,
+            toolName: action.name,
+            input: action.args,
+          },
+        });
+      }
+      if (!toolCallIds[index]) {
         throw new Error(`Approval action "${action.name}" has no tool call.`);
       }
     });
@@ -712,25 +913,42 @@ class DeepAgentsChatPanel {
     actions: ApprovalAction[],
   ): string[] {
     const used = new Set<string>();
+    const durableCalls = this.persistence.toolExecutions.list(runId);
     return actions.map((action) => {
       const inputHash = hashToolInput(action.args);
-      for (const [toolCallId, toolCall] of this.toolCalls) {
+      for (const toolCall of durableCalls) {
         if (
-          !used.has(toolCallId) &&
-          toolCall.name === action.name &&
-          hashToolInput(toolCall.input) === inputHash
+          !used.has(toolCall.toolCallId) &&
+          toolCall.toolName === action.name &&
+          toolCall.inputHash === inputHash
         ) {
-          const record = this.persistence.toolExecutions.get(runId, toolCallId);
-          if (record && record.inputHash === inputHash) {
-            used.add(toolCallId);
-            return toolCallId;
-          }
+          used.add(toolCall.toolCallId);
+          return toolCall.toolCallId;
         }
       }
       throw new Error(
         `Could not correlate approval action "${action.name}" with a durable tool call.`,
       );
     });
+  }
+
+  private findPendingApprovalRequestId(
+    sessionId: string,
+    runId: string,
+  ): string | undefined {
+    const pending = [
+      ...projectConversationEvents(
+        this.persistence.conversationEvents.list(sessionId),
+      ),
+    ].reverse().find(
+      (item) =>
+        item.kind === "approval_requested" &&
+        item.runId === runId &&
+        item.status === "pending",
+    );
+    return pending?.kind === "approval_requested"
+      ? pending.requestId
+      : undefined;
   }
 
   private async recordLatestCheckpoint(
@@ -957,9 +1175,18 @@ type WebviewMessage =
       type: "reconcileRecovery";
       runId: string;
       decision: "mark_completed" | "retry" | "abandon";
-    };
+    }
+  | { type: "resumePendingApproval"; runId: string };
 
 type ApprovalDecision = "once" | "session" | "deny";
+type GraphApprovalDecision =
+  | { type: "approve" }
+  | { type: "reject"; message: string };
+
+interface ApprovalPresentation {
+  requestId?: string;
+  recordRequest?: boolean;
+}
 
 interface ApprovalAction {
   name: string;
@@ -1014,6 +1241,9 @@ function isWebviewMessage(value: unknown): value is WebviewMessage {
         message.decision === "retry" ||
         message.decision === "abandon")
     );
+  }
+  if (type === "resumePendingApproval") {
+    return typeof (value as { runId?: unknown }).runId === "string";
   }
   return type === "send" && typeof (value as { text?: unknown }).text === "string";
 }
@@ -1230,6 +1460,7 @@ function prepareReplayItems(
 function createSession(
   persistence: PersistenceService,
   selectedModelKey: string,
+  processInstanceId: string,
 ): ChatSession {
   const stored = persistence.sessions.create({ selectedModelKey });
   return {
@@ -1238,13 +1469,14 @@ function createSession(
     title: stored.title,
     selectedModelKey,
     transcript: [],
-    allowedTools: allowedToolsForSession(stored.id),
+    allowedTools: allowedToolsForSession(processInstanceId, stored.id),
   };
 }
 
 function loadSessions(
   persistence: PersistenceService,
   fallbackModelKey: string,
+  processInstanceId: string,
 ): ChatSession[] {
   return persistence.sessions.list().map((session) => ({
     id: session.id,
@@ -1265,17 +1497,28 @@ function loadSessions(
             : ("assistant" as const),
         content: String(event.payload.content),
       })),
-    allowedTools: allowedToolsForSession(session.id),
+    allowedTools: allowedToolsForSession(processInstanceId, session.id),
   }));
 }
 
-function allowedToolsForSession(sessionId: string): Set<string> {
-  let allowed = processAllowedToolsBySession.get(sessionId);
+function allowedToolsForSession(
+  processInstanceId: string,
+  sessionId: string,
+): Set<string> {
+  const key = processApprovalGrantKey(processInstanceId, sessionId);
+  let allowed = processAllowedTools.get(key);
   if (!allowed) {
     allowed = new Set<string>();
-    processAllowedToolsBySession.set(sessionId, allowed);
+    processAllowedTools.set(key, allowed);
   }
   return allowed;
+}
+
+function processApprovalGrantKey(
+  processInstanceId: string,
+  sessionId: string,
+): string {
+  return `${processInstanceId}:${sessionId}`;
 }
 
 function modelKey(model: vscode.LanguageModelChat): string {
@@ -1685,6 +1928,11 @@ function renderWebview(
         element.appendChild(title);
         messages.appendChild(element);
       }
+      if (interactive) {
+        for (const details of element.querySelectorAll("details")) {
+          details.remove();
+        }
+      }
 
       for (const action of actions) {
         const details = document.createElement("details");
@@ -1855,6 +2103,20 @@ function renderWebview(
             });
             actions.appendChild(button);
           }
+          element.appendChild(actions);
+        } else if (recovery.recoveryClass === "waiting_for_approval") {
+          const actions = document.createElement("div");
+          actions.className = "recovery-actions";
+          const button = document.createElement("button");
+          button.type = "button";
+          button.textContent = "Review pending action";
+          button.addEventListener("click", () => {
+            vscode.postMessage({
+              type: "resumePendingApproval",
+              runId: recovery.runId,
+            });
+          });
+          actions.appendChild(button);
           element.appendChild(actions);
         }
         messages.appendChild(element);

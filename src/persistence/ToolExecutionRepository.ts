@@ -189,6 +189,19 @@ export class ToolExecutionRepository {
     ).map(mapRow);
   }
 
+  list(runId: string): ToolExecutionRecord[] {
+    return (
+      this.database.prepare(`
+        SELECT
+          run_id, tool_call_id, tool_name, input_json, input_hash,
+          effect_class, status, output_json
+        FROM tool_executions
+        WHERE run_id = ?
+        ORDER BY rowid
+      `).all(runId) as unknown as ToolExecutionRow[]
+    ).map(mapRow);
+  }
+
   authorizeReadOnlyRetries(runId: string): number {
     return Number(this.database.prepare(`
       UPDATE tool_executions

@@ -68,6 +68,39 @@ export class RecoveryService {
     });
   }
 
+  async getPendingInterrupts(runId: string): Promise<unknown[]> {
+    const run = this.runs.get(runId);
+    if (
+      !run ||
+      run.status !== "interrupted" ||
+      run.recoveryClass !== "waiting_for_approval"
+    ) {
+      throw new RecoveryBlockedError(
+        runId,
+        run?.recoveryClass ?? "not_resumable",
+        `Run "${runId}" is not waiting for a recoverable approval.`,
+      );
+    }
+    const tuple = await this.checkpointer.getTuple({
+      configurable: {
+        thread_id: run.threadId,
+        checkpoint_ns: run.checkpointNamespace,
+      },
+    });
+    const values = (tuple?.pendingWrites ?? [])
+      .filter(([, channel]) => channel === INTERRUPT)
+      .flatMap(([, , value]) => Array.isArray(value) ? value : [value])
+      .filter((value) => value !== null && value !== undefined);
+    if (values.length === 0) {
+      throw new RecoveryBlockedError(
+        runId,
+        "not_resumable",
+        "The persisted checkpoint no longer contains a pending approval.",
+      );
+    }
+    return values;
+  }
+
   assertExplicitResumeAllowed(runId: string): AgentRunRecord {
     const run = this.runs.get(runId);
     if (!run || run.status !== "interrupted" || !run.recoveryClass) {

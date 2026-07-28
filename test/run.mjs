@@ -9,6 +9,7 @@ const tests = [
   "command.integration",
   "sqliteCheckpointer.integration",
   "toolExecutionLedger.integration",
+  "pendingApprovalRecovery.integration",
   "interruptedContinuation.integration",
   "persistenceService.integration",
   "recovery.integration",

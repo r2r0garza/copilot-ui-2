@@ -19,6 +19,7 @@ export interface AgentRunRecord {
   threadId: string;
   checkpointNamespace: string;
   lastCheckpointId: string | null;
+  modelKey: string | null;
   compatibilityVersion: number;
   status: RunStatus;
   recoveryClass: RecoveryClass | null;
@@ -60,11 +61,65 @@ export class RunRepository {
     });
   }
 
+  resume(input: {
+    runId: string;
+    processInstanceId: string;
+    leaseExpiresAt: string;
+    allowedRecoveryClasses: RecoveryClass[];
+  }): { run: AgentRunRecord; attemptId: string } {
+    return inTransaction(this.database, () => {
+      const run = this.get(input.runId);
+      if (
+        !run ||
+        run.status !== "interrupted" ||
+        !run.recoveryClass ||
+        !input.allowedRecoveryClasses.includes(run.recoveryClass)
+      ) {
+        throw new Error(
+          `Run "${input.runId}" is not eligible for this recovery action.`,
+        );
+      }
+      const attemptId = randomUUID();
+      const now = isoNow();
+      this.database.prepare(`
+        INSERT INTO run_attempts (
+          id, run_id, process_instance_id, status, lease_expires_at,
+          heartbeat_at, started_at
+        ) VALUES (?, ?, ?, 'running', ?, ?, ?)
+      `).run(
+        attemptId,
+        run.id,
+        input.processInstanceId,
+        input.leaseExpiresAt,
+        now,
+        now,
+      );
+      this.database.prepare(`
+        UPDATE agent_runs SET
+          status = 'running',
+          recovery_class = NULL,
+          last_error = NULL,
+          completed_at = NULL,
+          updated_at = ?
+        WHERE id = ?
+      `).run(now, run.id);
+      return {
+        run: {
+          ...run,
+          status: "running",
+          recoveryClass: null,
+          lastError: null,
+        },
+        attemptId,
+      };
+    });
+  }
+
   get(runId: string): AgentRunRecord | undefined {
     const row = this.database.prepare(`
       SELECT
         id, session_id, goal_id, thread_id, checkpoint_ns,
-        last_checkpoint_id, compatibility_version, status,
+        last_checkpoint_id, model_key, compatibility_version, status,
         recovery_class, last_error
       FROM agent_runs
       WHERE id = ?
@@ -77,7 +132,7 @@ export class RunRepository {
       this.database.prepare(`
         SELECT
           id, session_id, goal_id, thread_id, checkpoint_ns,
-          last_checkpoint_id, compatibility_version, status,
+          last_checkpoint_id, model_key, compatibility_version, status,
           recovery_class, last_error
         FROM agent_runs
         WHERE session_id = ?
@@ -98,7 +153,7 @@ export class RunRepository {
         SELECT DISTINCT
           runs.id, runs.session_id, runs.goal_id, runs.thread_id,
           runs.checkpoint_ns, runs.last_checkpoint_id,
-          runs.compatibility_version, runs.status,
+          runs.model_key, runs.compatibility_version, runs.status,
           runs.recovery_class, runs.last_error
         FROM agent_runs AS runs
         JOIN run_attempts AS attempts ON attempts.run_id = runs.id
@@ -242,6 +297,7 @@ interface RunRow {
   thread_id: string;
   checkpoint_ns: string;
   last_checkpoint_id: string | null;
+  model_key: string | null;
   compatibility_version: number;
   status: RunStatus;
   recovery_class: RecoveryClass | null;
@@ -256,6 +312,7 @@ function mapRun(row: RunRow): AgentRunRecord {
     threadId: row.thread_id,
     checkpointNamespace: row.checkpoint_ns,
     lastCheckpointId: row.last_checkpoint_id,
+    modelKey: row.model_key,
     compatibilityVersion: row.compatibility_version,
     status: row.status,
     recoveryClass: row.recovery_class,
