@@ -1,0 +1,70 @@
+{
+  "name": "deepagents-vscode-spike",
+  "displayName": "Deep Agents + Copilot Spike",
+  "description": "A spike that runs the Deep Agents harness on top of VS Code's Copilot language models.",
+  "version": "0.0.1",
+  "private": true,
+  "publisher": "local-spike",
+  "engines": {
+    "vscode": "^1.105.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "deepagentsSpike",
+          "title": "Deep Agents",
+          "icon": "assets/deepagents.svg"
+        }
+      ]
+    },
+    "views": {
+      "deepagentsSpike": [
+        {
+          "type": "webview",
+          "id": "deepagentsSpike.launcher",
+          "name": "Agent Workbench"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "deepagentsSpike.openChat",
+        "title": "Deep Agents: Open Chat"
+      }
+    ],
+    "configuration": {
+      "title": "Deep Agents + Copilot Spike",
+      "properties": {
+        "deepagentsSpike.modelFamily": {
+          "type": "string",
+          "default": "",
+          "description": "Optional Copilot model family filter. Leave empty to show all available Copilot models in the workbench."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "check": "tsc --noEmit",
+    "test": "npm run check && npm run build && node test/run.mjs"
+  },
+  "dependencies": {
+    "@langchain/core": "^1.0.0",
+    "@langchain/langgraph": "^1.4.8",
+    "deepagents": "^1.0.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "1.105.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.9.0"
+  }
+}
