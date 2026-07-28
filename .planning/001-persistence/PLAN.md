@@ -9,7 +9,7 @@
 - [x] Plan 01 — selected and verified a `node:sqlite` LangGraph checkpointer; native addon packaging was rejected.
 - [x] Plan 02 — database lifecycle, migration 1, typed repositories, and integration tests.
 - [x] Plan 03.1 — workspace sessions, messages, titles, models, Clear, and Delete are wired to persistence.
-- [ ] Plan 03.2 — activity events are persisted, but restored tool/approval rows still need UI replay.
+- [x] Plan 03.2 — persisted messages, tool activity, approvals, errors, and cancellations replay in sequence; restored controls are inert and tool rows are collapsed.
 - [x] Plan 04.1 — production turns use the shared durable checkpointer, stable thread IDs, and incremental input.
 - [ ] Plan 04.2 — add the deterministic interrupted Deep Agents continuation test.
 - [ ] Plans 05–06 — recovery classification, reconciliation UI, tool ledger integration, and operational hardening.

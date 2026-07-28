@@ -9,6 +9,10 @@ import {
 import { WorkbenchSidebarProvider } from "./sidebarProvider";
 import { VsCodeChatModel, type AdapterEvent } from "./vscodeChatModel";
 import { PersistenceService } from "./persistence/PersistenceService";
+import {
+  projectConversationEvents,
+  type ConversationReplayItem,
+} from "./persistence/ConversationReplayProjection";
 
 let currentPanel: DeepAgentsChatPanel | undefined;
 const processAllowedToolsBySession = new Map<string, Set<string>>();
@@ -624,6 +628,13 @@ class DeepAgentsChatPanel {
 
   private async postWorkbenchState(replaceMessages: boolean): Promise<void> {
     const active = this.activeSession;
+    const replayItems = replaceMessages
+      ? prepareReplayItems(
+          projectConversationEvents(
+            this.persistence.conversationEvents.list(active.id),
+          ),
+        )
+      : undefined;
     this.panel.title = active.title === "New chat" ? "Deep Agents Workbench" : active.title;
     await this.post({
       type: "workbenchState",
@@ -640,7 +651,7 @@ class DeepAgentsChatPanel {
         id: session.id,
         title: session.title,
       })),
-      transcript: replaceMessages ? active.transcript : undefined,
+      replayItems,
     });
   }
 
@@ -658,6 +669,7 @@ class DeepAgentsChatPanel {
           toolCallId: event.id,
           toolName: event.name,
           input,
+          label: describeToolActivity(event.name, input, "running"),
         },
       });
       await this.post({
@@ -682,6 +694,11 @@ class DeepAgentsChatPanel {
           toolCallId: event.id,
           output: event.text.slice(0, 100_000),
           truncated: event.text.length > 100_000,
+          originalLength: event.text.length,
+          retainedLength: Math.min(event.text.length, 100_000),
+          label: toolCall
+            ? describeToolActivity(toolCall.name, toolCall.input, outcome)
+            : undefined,
         },
       });
       await this.post({
@@ -941,6 +958,42 @@ function truncateActivityText(value: string): string {
 
 function toRecord(value: object): Record<string, unknown> {
   return Object.fromEntries(Object.entries(value));
+}
+
+function prepareReplayItems(
+  items: ConversationReplayItem[],
+): ConversationReplayItem[] {
+  return items.map((item) => {
+    if (item.kind === "tool_call" && !item.label) {
+      const input =
+        item.input && typeof item.input === "object"
+          ? toRecord(item.input)
+          : {};
+      return {
+        ...item,
+        label: describeToolActivity(item.toolName, input, "running"),
+      };
+    }
+    if (item.kind === "tool_result" && !item.label) {
+      const output = typeof item.output === "string" ? item.output : "";
+      const phase = output.trimStart().startsWith("Blocked")
+        ? "blocked"
+        : output.trimStart().startsWith("Error")
+          ? "failed"
+          : "completed";
+      return {
+        ...item,
+        label: item.toolName
+          ? describeToolActivity(item.toolName, {}, phase)
+          : phase === "blocked"
+            ? "Blocked tool call"
+            : phase === "failed"
+              ? "Tool call failed"
+              : "Completed tool call",
+      };
+    }
+    return item;
+  });
 }
 
 function createSession(
@@ -1366,22 +1419,24 @@ function renderWebview(
       messages.scrollTop = messages.scrollHeight;
     }
 
-    function addApproval(requestId, actions, allowSession) {
+    function addApproval(requestId, actions, allowSession, interactive = true) {
       document.getElementById("empty")?.remove();
-      const element = document.createElement("section");
-      element.className = "approval";
-      element.dataset.approvalId = requestId;
-
-      const title = document.createElement("div");
-      title.className = "approval-title";
-      title.textContent = actions.length === 1
-        ? "Approval required: " + actions[0].name
-        : "Approval required for " + actions.length + " file operations";
-      element.appendChild(title);
+      let element = document.querySelector(
+        '[data-approval-id="' + CSS.escape(requestId) + '"]'
+      );
+      if (!element) {
+        element = document.createElement("section");
+        element.className = "approval";
+        element.dataset.approvalId = requestId;
+        const title = document.createElement("div");
+        title.className = "approval-title";
+        element.appendChild(title);
+        messages.appendChild(element);
+      }
 
       for (const action of actions) {
         const details = document.createElement("details");
-        details.open = true;
+        details.open = interactive;
         const summary = document.createElement("summary");
         summary.textContent = action.name;
         details.appendChild(summary);
@@ -1393,33 +1448,42 @@ function renderWebview(
         const pre = document.createElement("pre");
         pre.textContent = JSON.stringify(action.args, null, 2);
         details.appendChild(pre);
-        element.appendChild(details);
+        element.insertBefore(
+          details,
+          element.querySelector(".approval-status, .approval-actions"),
+        );
       }
 
-      const controls = document.createElement("div");
-      controls.className = "approval-actions";
-      const choices = [
-        ["once", "Allow once", ""],
-        ["deny", "Deny for now", "deny"],
-      ];
-      if (allowSession) {
-        choices.splice(1, 0, ["session", "Allow for session", ""]);
+      const actionCount = element.querySelectorAll("details").length;
+      element.querySelector(".approval-title").textContent = actionCount === 1
+        ? "Approval required: " + actions[0].name
+        : "Approval required for " + actionCount + " operations";
+
+      if (interactive && !element.querySelector(".approval-actions")) {
+        const controls = document.createElement("div");
+        controls.className = "approval-actions";
+        const choices = [
+          ["once", "Allow once", ""],
+          ["deny", "Deny for now", "deny"],
+        ];
+        if (allowSession) {
+          choices.splice(1, 0, ["session", "Allow for session", ""]);
+        }
+        for (const [decision, label, className] of choices) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.textContent = label;
+          button.className = className;
+          button.addEventListener("click", () => {
+            for (const control of controls.querySelectorAll("button")) {
+              control.disabled = true;
+            }
+            vscode.postMessage({ type: "approval", requestId, decision });
+          });
+          controls.appendChild(button);
+        }
+        element.appendChild(controls);
       }
-      for (const [decision, label, className] of choices) {
-        const button = document.createElement("button");
-        button.type = "button";
-        button.textContent = label;
-        button.className = className;
-        button.addEventListener("click", () => {
-          for (const control of controls.querySelectorAll("button")) {
-            control.disabled = true;
-          }
-          vscode.postMessage({ type: "approval", requestId, decision });
-        });
-        controls.appendChild(button);
-      }
-      element.appendChild(controls);
-      messages.appendChild(element);
       messages.scrollTop = messages.scrollHeight;
     }
 
@@ -1427,8 +1491,18 @@ function renderWebview(
       const element = document.querySelector(
         '[data-approval-id="' + CSS.escape(requestId) + '"]'
       );
-      if (!element) return;
+      if (!element) {
+        element = document.createElement("section");
+        element.className = "approval";
+        element.dataset.approvalId = requestId;
+        const title = document.createElement("div");
+        title.className = "approval-title";
+        title.textContent = "Approval decision";
+        element.appendChild(title);
+        messages.appendChild(element);
+      }
       element.querySelector(".approval-actions")?.remove();
+      element.querySelector(".approval-status")?.remove();
       const status = document.createElement("div");
       status.className = "approval-status";
       status.textContent = decision === "once"
@@ -1439,18 +1513,51 @@ function renderWebview(
       element.appendChild(status);
     }
 
-    function replaceTranscript(transcript) {
+    function replaceConversation(replayItems) {
       messages.replaceChildren();
       draft = null;
-      if (!transcript?.length) {
+      if (!replayItems?.length) {
         const emptyState = document.createElement("div");
         emptyState.id = "empty";
         emptyState.textContent = "Start a conversation with a workspace-scoped agent.";
         messages.appendChild(emptyState);
         return;
       }
-      for (const message of transcript) {
-        addMessage(message.role, message.content);
+      for (const item of replayItems) {
+        if (item.kind === "message") {
+          addMessage(item.role, item.content);
+        } else if (item.kind === "tool_call") {
+          addActivity(
+            item.toolCallId,
+            item.label || "Tool call",
+            JSON.stringify(item.input, null, 2),
+          );
+        } else if (item.kind === "tool_result") {
+          let output = typeof item.output === "string"
+            ? item.output
+            : JSON.stringify(item.output, null, 2);
+          if (item.truncation?.truncated) {
+            output += "\\n\\n[Persisted output was truncated]";
+          }
+          addActivity(item.toolCallId, item.label || "Tool result", output);
+        } else if (item.kind === "approval_requested") {
+          addApproval(item.requestId, [{
+            name: item.toolName,
+            args: item.input || {},
+          }], false, false);
+          if (item.status === "resolved") {
+            resolveApproval(item.requestId, item.decision);
+          }
+        } else if (item.kind === "approval_resolved") {
+          resolveApproval(item.requestId, item.decision);
+        } else if (item.kind === "run_status") {
+          addMessage(
+            "assistant",
+            item.status === "cancelled"
+              ? "Cancelled: " + item.message
+              : "Error: " + item.message,
+          );
+        }
       }
       messages.scrollTop = messages.scrollHeight;
     }
@@ -1599,7 +1706,7 @@ function renderWebview(
           currentSessionId = data.currentSessionId;
           renderSessions(data.sessions);
           renderModels(data.models, data.selectedModelKey);
-          if (data.replaceMessages) replaceTranscript(data.transcript);
+          if (data.replaceMessages) replaceConversation(data.replayItems);
           break;
         case "runStarted":
           setRunning(true);

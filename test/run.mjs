@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 const tests = [
   "adapter.integration",
   "approval.integration",
+  "conversationReplayProjection.test",
   "executeCommandTool.test",
   "command.integration",
   "sqliteCheckpointer.integration",
