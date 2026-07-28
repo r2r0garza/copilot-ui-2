@@ -37,6 +37,10 @@ async function main(): Promise<void> {
           version: 1,
           name: "persistence_foundation",
         },
+        {
+          version: 2,
+          name: "recovery_reconciliation",
+        },
       ],
     );
     assert.throws(() => {
@@ -62,7 +66,7 @@ async function main(): Promise<void> {
           .prepare("SELECT COUNT(*) AS count FROM app_migrations")
           .get() as { count: number }
       ).count,
-      1,
+      2,
     );
     second.database
       .prepare(`

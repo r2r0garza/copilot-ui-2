@@ -13,9 +13,12 @@ import {
   projectConversationEvents,
   type ConversationReplayItem,
 } from "./persistence/ConversationReplayProjection";
+import { CURRENT_GRAPH_COMPATIBILITY_VERSION } from "./persistence/RecoveryService";
 
 let currentPanel: DeepAgentsChatPanel | undefined;
 const processAllowedToolsBySession = new Map<string, Set<string>>();
+const RUN_LEASE_MS = 30_000;
+const RUN_HEARTBEAT_MS = 10_000;
 
 export function activate(context: vscode.ExtensionContext): void {
   let persistence: PersistenceService | undefined;
@@ -43,6 +46,10 @@ export function activate(context: vscode.ExtensionContext): void {
         persistence = await PersistenceService.open(
           context.storageUri,
           workspaceUri,
+        );
+        await persistence.recovery.recoverExpiredAttempts(
+          new Date(),
+          processInstanceId,
         );
         context.subscriptions.push({
           dispose: () => persistence?.close(),
@@ -260,6 +267,47 @@ class DeepAgentsChatPanel {
       }
       return;
     }
+    if (raw.type === "reconcileRecovery" && !this.running) {
+      const recovery = this.persistence.recovery
+        .listForSession(this.activeSession.id)
+        .find((item) => item.run.id === raw.runId);
+      if (
+        !recovery ||
+        recovery.recoveryClass !== "needs_review" ||
+        !recovery.uncertainToolCallId
+      ) {
+        return;
+      }
+      if (raw.decision === "retry") {
+        const confirmed = await vscode.window.showWarningMessage(
+          "The original operation may already have completed. Retrying later could repeat its side effects.",
+          { modal: true },
+          "Acknowledge and retry",
+        );
+        if (confirmed !== "Acknowledge and retry") {
+          return;
+        }
+      }
+      if (raw.decision === "abandon") {
+        const confirmed = await vscode.window.showWarningMessage(
+          "Abandon this interrupted run? Its recovery and tool audit history will be preserved.",
+          { modal: true },
+          "Abandon run",
+        );
+        if (confirmed !== "Abandon run") {
+          return;
+        }
+      }
+      this.persistence.recoveryDecisions.reconcile({
+        runId: recovery.run.id,
+        toolCallId: recovery.uncertainToolCallId,
+        decision: raw.decision,
+        warningAcknowledged: raw.decision === "retry",
+        processInstanceId: this.processInstanceId,
+      });
+      await this.postWorkbenchState(true);
+      return;
+    }
     if (raw.type === "selectModel" && !this.running) {
       if (this.models.some((model) => modelKey(model) === raw.modelKey)) {
         this.activeSession.selectedModelKey = raw.modelKey;
@@ -347,10 +395,28 @@ class DeepAgentsChatPanel {
     this.toolCalls.clear();
     const session = this.activeSession;
     const model = this.selectedModel;
+    const { runId, attemptId } = this.persistence.runs.start({
+      sessionId: session.id,
+      threadId: session.threadId,
+      checkpointNamespace: "",
+      modelKey: modelKey(model),
+      processInstanceId: this.processInstanceId,
+      leaseExpiresAt: leaseExpiration(),
+      compatibilityVersion: CURRENT_GRAPH_COMPATIBILITY_VERSION,
+    });
+    const heartbeat = setInterval(() => {
+      try {
+        this.persistence.runs.heartbeat(attemptId, leaseExpiration());
+      } catch {
+        this.cancellation?.abort();
+      }
+    }, RUN_HEARTBEAT_MS);
+    heartbeat.unref();
     const isFirstMessage = session.transcript.length === 0;
     session.transcript.push({ role: "user", content: prompt });
     this.persistence.conversationEvents.append({
       sessionId: session.id,
+      runId,
       eventType: "user_message",
       payload: { schemaVersion: 1, content: prompt },
     });
@@ -368,7 +434,7 @@ class DeepAgentsChatPanel {
         if (event.kind === "text") {
           streamedFinalText += event.text;
         }
-        void this.postAdapterEvent(event);
+        void this.postAdapterEvent(event, runId, session.id);
       },
     });
 
@@ -428,9 +494,12 @@ class DeepAgentsChatPanel {
         },
         runConfig,
       );
+      await this.recordLatestCheckpoint(runId, session);
 
       let approvalRequest = extractApprovalRequest(result);
       while (approvalRequest) {
+        this.persistence.runs.setExecutionStatus(runId, "waiting_approval");
+        await this.recordLatestCheckpoint(runId, session);
         const commandGuardError = getCommandGuardError(
           approvalRequest.actions,
           this.workspaceRoot,
@@ -451,7 +520,11 @@ class DeepAgentsChatPanel {
             ].join(" "),
           }));
         } else {
-          const decision = await this.requestApproval(approvalRequest.actions);
+          const decision = await this.requestApproval(
+            approvalRequest.actions,
+            runId,
+            session.id,
+          );
           if (decision === "session") {
             for (const action of approvalRequest.actions) {
               session.allowedTools.add(action.name);
@@ -469,6 +542,8 @@ class DeepAgentsChatPanel {
 
         const resume = { decisions };
         result = await agent.invoke(new Command({ resume }), runConfig);
+        this.persistence.runs.setExecutionStatus(runId, "running");
+        await this.recordLatestCheckpoint(runId, session);
         approvalRequest = extractApprovalRequest(result);
       }
 
@@ -478,9 +553,11 @@ class DeepAgentsChatPanel {
       session.transcript.push({ role: "assistant", content: finalText });
       this.persistence.conversationEvents.append({
         sessionId: session.id,
+        runId,
         eventType: "assistant_message",
         payload: { schemaVersion: 1, content: finalText },
       });
+      this.persistence.runs.finish(runId, attemptId, "completed");
       await this.post({ type: "runCompleted", text: finalText });
     } catch (error) {
       const cancelled = this.cancellation.signal.aborted;
@@ -488,22 +565,34 @@ class DeepAgentsChatPanel {
       session.transcript.push({ role: "assistant", content: message });
       this.persistence.conversationEvents.append({
         sessionId: session.id,
+        runId,
         eventType: cancelled ? "run_cancelled" : "run_error",
         payload: cancelled
           ? { schemaVersion: 1, reason: message }
           : { schemaVersion: 1, message },
       });
+      this.persistence.runs.finish(
+        runId,
+        attemptId,
+        cancelled ? "cancelled" : "failed",
+        message,
+      );
       await this.post({
         type: "runFailed",
         message,
       });
     } finally {
+      clearInterval(heartbeat);
       this.running = false;
       this.cancellation = undefined;
     }
   }
 
-  private async requestApproval(actions: ApprovalAction[]): Promise<ApprovalDecision> {
+  private async requestApproval(
+    actions: ApprovalAction[],
+    runId: string,
+    sessionId: string,
+  ): Promise<ApprovalDecision> {
     const requestId = crypto.randomUUID();
     const allowSession = actions.every(
       (action) =>
@@ -522,7 +611,8 @@ class DeepAgentsChatPanel {
     });
     for (const action of actions) {
       this.persistence.conversationEvents.append({
-        sessionId: this.activeSession.id,
+        sessionId,
+        runId,
         eventType: "approval_requested",
         payload: {
           schemaVersion: 1,
@@ -540,18 +630,35 @@ class DeepAgentsChatPanel {
     });
     for (const action of actions) {
       this.persistence.conversationEvents.append({
-        sessionId: this.activeSession.id,
+        sessionId,
+        runId,
         eventType: "approval_resolved",
         payload: { schemaVersion: 1, requestId, decision },
       });
       this.persistence.approvals.record({
-        sessionId: this.activeSession.id,
+        sessionId,
+        runId,
         toolName: action.name,
         decision: decision === "deny" ? "deny" : decision,
         processInstanceId: this.processInstanceId,
       });
     }
     return decision;
+  }
+
+  private async recordLatestCheckpoint(
+    runId: string,
+    session: ChatSession,
+  ): Promise<void> {
+    const tuple = await this.persistence.checkpointer.getTuple({
+      configurable: {
+        thread_id: session.threadId,
+        checkpoint_ns: "",
+      },
+    });
+    if (tuple?.checkpoint.id) {
+      this.persistence.runs.recordCheckpoint(runId, tuple.checkpoint.id);
+    }
   }
 
   private resolvePendingApproval(decision: ApprovalDecision): void {
@@ -651,18 +758,32 @@ class DeepAgentsChatPanel {
         id: session.id,
         title: session.title,
       })),
+      recoveries: this.persistence.recovery.listForSession(active.id).map(
+        (recovery) => ({
+          runId: recovery.run.id,
+          recoveryClass: recovery.recoveryClass,
+          reason: recovery.reason,
+          toolCallId: recovery.uncertainToolCallId,
+          toolName: recovery.uncertainToolName,
+        }),
+      ),
       replayItems,
     });
   }
 
-  private async postAdapterEvent(event: AdapterEvent): Promise<void> {
+  private async postAdapterEvent(
+    event: AdapterEvent,
+    runId: string,
+    sessionId: string,
+  ): Promise<void> {
     if (event.kind === "text") {
       await this.post({ type: "textDelta", text: event.text });
     } else if (event.kind === "toolCall") {
       const input = toRecord(event.input);
       this.toolCalls.set(event.id, { name: event.name, input });
       this.persistence.conversationEvents.append({
-        sessionId: this.activeSession.id,
+        sessionId,
+        runId,
         eventType: "tool_call",
         payload: {
           schemaVersion: 1,
@@ -687,7 +808,8 @@ class DeepAgentsChatPanel {
           ? "failed"
           : "completed";
       this.persistence.conversationEvents.append({
-        sessionId: this.activeSession.id,
+        sessionId,
+        runId,
         eventType: "tool_result",
         payload: {
           schemaVersion: 1,
@@ -735,6 +857,11 @@ type WebviewMessage =
       type: "approval";
       requestId: string;
       decision: ApprovalDecision;
+    }
+  | {
+      type: "reconcileRecovery";
+      runId: string;
+      decision: "mark_completed" | "retry" | "abandon";
     };
 
 type ApprovalDecision = "once" | "session" | "deny";
@@ -782,6 +909,15 @@ function isWebviewMessage(value: unknown): value is WebviewMessage {
       (message.decision === "once" ||
         message.decision === "session" ||
         message.decision === "deny")
+    );
+  }
+  if (type === "reconcileRecovery") {
+    const message = value as { runId?: unknown; decision?: unknown };
+    return (
+      typeof message.runId === "string" &&
+      (message.decision === "mark_completed" ||
+        message.decision === "retry" ||
+        message.decision === "abandon")
     );
   }
   return type === "send" && typeof (value as { text?: unknown }).text === "string";
@@ -1071,6 +1207,10 @@ function fallbackTitle(firstMessage: string): string {
   return words.slice(0, 7).join(" ").slice(0, 80) || "New chat";
 }
 
+function leaseExpiration(): string {
+  return new Date(Date.now() + RUN_LEASE_MS).toISOString();
+}
+
 function renderWebview(
   webview: vscode.Webview,
   workspaceRoot: string,
@@ -1302,6 +1442,23 @@ function renderWebview(
       background: var(--vscode-button-secondaryBackground);
     }
     .approval-status { margin-top: 8px; opacity: .8; }
+    .recovery {
+      align-self: stretch;
+      padding: 12px;
+      border: 1px solid var(--vscode-inputValidation-infoBorder);
+      background: var(--vscode-inputValidation-infoBackground);
+    }
+    .recovery.needs-review {
+      border-color: var(--vscode-inputValidation-warningBorder);
+      background: var(--vscode-inputValidation-warningBackground);
+    }
+    .recovery-title { font-weight: 600; margin-bottom: 6px; }
+    .recovery-reason { line-height: 1.4; }
+    .recovery-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+    .recovery .deny {
+      color: var(--vscode-button-secondaryForeground);
+      background: var(--vscode-button-secondaryBackground);
+    }
     #empty { opacity: .65; margin: auto; text-align: center; }
     form {
       padding: 12px;
@@ -1562,6 +1719,53 @@ function renderWebview(
       messages.scrollTop = messages.scrollHeight;
     }
 
+    function renderRecoveries(recoveries) {
+      for (const recovery of recoveries || []) {
+        document.getElementById("empty")?.remove();
+        const element = document.createElement("section");
+        element.className = "recovery" +
+          (recovery.recoveryClass === "needs_review" ? " needs-review" : "");
+        const title = document.createElement("div");
+        title.className = "recovery-title";
+        title.textContent = recovery.recoveryClass === "safe_to_resume"
+          ? "Interrupted run is safe to resume"
+          : recovery.recoveryClass === "waiting_for_approval"
+            ? "Interrupted run is waiting for approval"
+            : recovery.recoveryClass === "needs_review"
+              ? "Interrupted tool operation needs review"
+              : "Interrupted run cannot be resumed";
+        element.appendChild(title);
+        const reason = document.createElement("div");
+        reason.className = "recovery-reason";
+        reason.textContent = recovery.reason;
+        element.appendChild(reason);
+        if (recovery.recoveryClass === "needs_review" && recovery.toolCallId) {
+          const actions = document.createElement("div");
+          actions.className = "recovery-actions";
+          for (const [decision, label, className] of [
+            ["mark_completed", "Mark completed", ""],
+            ["retry", "Retry", ""],
+            ["abandon", "Abandon run", "deny"],
+          ]) {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.textContent = label;
+            button.className = className;
+            button.addEventListener("click", () => {
+              vscode.postMessage({
+                type: "reconcileRecovery",
+                runId: recovery.runId,
+                decision,
+              });
+            });
+            actions.appendChild(button);
+          }
+          element.appendChild(actions);
+        }
+        messages.appendChild(element);
+      }
+    }
+
     function beginRename(row, session) {
       const name = row.querySelector(".session-name");
       const input = document.createElement("input");
@@ -1706,7 +1910,10 @@ function renderWebview(
           currentSessionId = data.currentSessionId;
           renderSessions(data.sessions);
           renderModels(data.models, data.selectedModelKey);
-          if (data.replaceMessages) replaceConversation(data.replayItems);
+          if (data.replaceMessages) {
+            replaceConversation(data.replayItems);
+            renderRecoveries(data.recoveries);
+          }
           break;
         case "runStarted":
           setRunning(true);

@@ -113,7 +113,7 @@ The extension is bundled to `dist/extension.js`; `vscode` remains external and i
 - Workspace access uses Deep Agents' `FilesystemBackend` in virtual mode. `/` maps to the first workspace folder, and traversal outside it is rejected.
 - The built-in filesystem/planning/subagent tools are enabled.
 - Host process execution is available only through the custom `execute_command` tool. Deep Agents' unrestricted `LocalShellBackend` is not enabled.
-- `write_file` and `edit_file` use Deep Agents human-in-the-loop interrupts backed by the shared SQLite LangGraph checkpointer. Durable continuation across a fresh runtime is covered by integration tests; startup recovery UI is not implemented yet.
+- `write_file` and `edit_file` use Deep Agents human-in-the-loop interrupts backed by the shared SQLite LangGraph checkpointer. Startup recovery classifies stale runs and displays recovery state in the originating chat; automatic continuation is intentionally disabled.
 - `execute_command` uses the same interrupt mechanism and can be allowed for the active chat session. This allowance covers the tool as a whole, not a particular executable or argument signature.
 - VS Code does not support system-role messages in this API, so the adapter encodes LangChain system messages as clearly delimited user-role instructions.
 - Conversation sessions, model choices, messages, tool traces, and approval outcomes are persisted per workspace and restored after switching sessions or reloading the Extension Host.
@@ -122,7 +122,7 @@ The extension is bundled to `dist/extension.js`; `vscode` remains external and i
 
 ## Useful next experiments
 
-1. Classify interrupted runs at startup and expose safe recovery actions.
+1. Integrate every tool execution with the durable side-effect ledger and explicit continuation controls.
 2. Add per-path approval policies and a visible way to revoke session allowances.
 3. Replace whole-tool command session approval with narrowly scoped policies, such as an exact `npm test` signature.
 4. Add a workbench tool for diagnostics or active-editor context.

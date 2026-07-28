@@ -9,6 +9,8 @@ import { CheckpointCleanupRepository } from "./CheckpointCleanupRepository";
 import { ConversationEventRepository } from "./ConversationEventRepository";
 import { GoalRepository } from "./GoalRepository";
 import { RunRepository } from "./RunRepository";
+import { RecoveryRepository } from "./RecoveryRepository";
+import { RecoveryService } from "./RecoveryService";
 import { SessionRepository } from "./SessionRepository";
 import { ToolExecutionRepository } from "./ToolExecutionRepository";
 
@@ -31,6 +33,8 @@ export class PersistenceService {
   readonly conversationEvents: ConversationEventRepository;
   readonly goals: GoalRepository;
   readonly runs: RunRepository;
+  readonly recovery: RecoveryService;
+  readonly recoveryDecisions: RecoveryRepository;
   readonly toolExecutions: ToolExecutionRepository;
   readonly approvals: ApprovalRepository;
   readonly checkpointCleanup: CheckpointCleanupRepository;
@@ -45,9 +49,15 @@ export class PersistenceService {
     this.conversationEvents = new ConversationEventRepository(database);
     this.goals = new GoalRepository(database);
     this.runs = new RunRepository(database);
+    this.recoveryDecisions = new RecoveryRepository(database);
     this.toolExecutions = new ToolExecutionRepository(database);
     this.approvals = new ApprovalRepository(database);
     this.checkpointCleanup = new CheckpointCleanupRepository(database);
+    this.recovery = new RecoveryService(
+      this.runs,
+      this.toolExecutions,
+      this.checkpointer,
+    );
   }
 
   static async open(

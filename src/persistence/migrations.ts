@@ -230,6 +230,30 @@ export const APP_MIGRATIONS: readonly Migration[] = [
       END;
     `,
   },
+  {
+    version: 2,
+    name: "recovery_reconciliation",
+    sql: `
+      CREATE TABLE recovery_reconciliations (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        tool_call_id TEXT NOT NULL,
+        decision TEXT NOT NULL CHECK (
+          decision IN ('mark_completed', 'retry', 'abandon')
+        ),
+        warning_acknowledged INTEGER NOT NULL DEFAULT 0 CHECK (
+          warning_acknowledged IN (0, 1)
+        ),
+        process_instance_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (run_id, tool_call_id),
+        FOREIGN KEY (run_id, tool_call_id)
+          REFERENCES tool_executions(run_id, tool_call_id) ON DELETE CASCADE
+      );
+      CREATE INDEX recovery_reconciliations_run_created_idx
+        ON recovery_reconciliations(run_id, created_at);
+    `,
+  },
 ];
 
 export function applyMigrations(

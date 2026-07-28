@@ -10,6 +10,7 @@ const tests = [
   "sqliteCheckpointer.integration",
   "interruptedContinuation.integration",
   "persistenceService.integration",
+  "recovery.integration",
   "repositories.integration",
 ];
 

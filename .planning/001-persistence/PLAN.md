@@ -12,7 +12,8 @@
 - [x] Plan 03.2 — persisted messages, tool activity, approvals, errors, and cancellations replay in sequence; restored controls are inert and tool rows are collapsed.
 - [x] Plan 04.1 — production turns use the shared durable checkpointer, stable thread IDs, and incremental input.
 - [x] Plan 04.2 — a deterministic fresh-process test resumes an interrupted durable graph without rerunning completed steps and verifies typed checkpoint recovery errors.
-- [ ] Plans 05–06 — recovery classification, reconciliation UI, tool ledger integration, and operational hardening.
+- [x] Plan 05.1 — run leases and heartbeats, startup recovery classification, session-scoped recovery cards, and durable side-effect reconciliation decisions.
+- [ ] Plans 05.2–06 — tool ledger execution integration, restart-expiring approval authority, future-goal fixtures, and operational hardening.
 
 ## Objective
 
