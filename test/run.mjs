@@ -8,6 +8,7 @@ const tests = [
   "executeCommandTool.test",
   "command.integration",
   "sqliteCheckpointer.integration",
+  "interruptedContinuation.integration",
   "persistenceService.integration",
   "repositories.integration",
 ];
