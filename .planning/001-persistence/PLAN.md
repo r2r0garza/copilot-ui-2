@@ -1,8 +1,18 @@
 # Persistence Foundation Plan
 
-**Status:** Ready for implementation  
+**Status:** In progress  
 **Created:** 2026-07-28  
 **Scope:** Durable chat sessions now; crash-resumable goals and long-running work later  
+
+## Implementation Progress
+
+- [x] Plan 01 — selected and verified a `node:sqlite` LangGraph checkpointer; native addon packaging was rejected.
+- [x] Plan 02 — database lifecycle, migration 1, typed repositories, and integration tests.
+- [x] Plan 03.1 — workspace sessions, messages, titles, models, Clear, and Delete are wired to persistence.
+- [ ] Plan 03.2 — activity events are persisted, but restored tool/approval rows still need UI replay.
+- [x] Plan 04.1 — production turns use the shared durable checkpointer, stable thread IDs, and incremental input.
+- [ ] Plan 04.2 — add the deterministic interrupted Deep Agents continuation test.
+- [ ] Plans 05–06 — recovery classification, reconciliation UI, tool ledger integration, and operational hardening.
 
 ## Objective
 
