@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { AIMessage } from "@langchain/core/messages";
-import { Command, MemorySaver } from "@langchain/langgraph";
+import { Command } from "@langchain/langgraph";
 import { createDeepAgent, FilesystemBackend } from "deepagents";
 import {
   createExecuteCommandTool,
@@ -8,10 +8,14 @@ import {
 } from "./executeCommandTool";
 import { WorkbenchSidebarProvider } from "./sidebarProvider";
 import { VsCodeChatModel, type AdapterEvent } from "./vscodeChatModel";
+import { PersistenceService } from "./persistence/PersistenceService";
 
 let currentPanel: DeepAgentsChatPanel | undefined;
+const processAllowedToolsBySession = new Map<string, Set<string>>();
 
 export function activate(context: vscode.ExtensionContext): void {
+  let persistence: PersistenceService | undefined;
+  const processInstanceId = crypto.randomUUID();
   const openWorkbench = async (): Promise<void> => {
     if (currentPanel) {
       currentPanel.reveal();
@@ -23,9 +27,39 @@ export function activate(context: vscode.ExtensionContext): void {
       return;
     }
 
-    currentPanel = new DeepAgentsChatPanel(context, models, () => {
-      currentPanel = undefined;
-    });
+    const workspaceUri = vscode.workspace.workspaceFolders?.[0]?.uri;
+    if (!workspaceUri || !context.storageUri) {
+      void vscode.window.showErrorMessage(
+        "Deep Agents persistence requires an open workspace.",
+      );
+      return;
+    }
+    if (!persistence) {
+      try {
+        persistence = await PersistenceService.open(
+          context.storageUri,
+          workspaceUri,
+        );
+        context.subscriptions.push({
+          dispose: () => persistence?.close(),
+        });
+      } catch (error) {
+        void vscode.window.showErrorMessage(
+          error instanceof Error ? error.message : String(error),
+        );
+        return;
+      }
+    }
+
+    currentPanel = new DeepAgentsChatPanel(
+      context,
+      models,
+      persistence,
+      processInstanceId,
+      () => {
+        currentPanel = undefined;
+      },
+    );
   };
 
   context.subscriptions.push(
@@ -64,7 +98,9 @@ async function selectCopilotModels(): Promise<vscode.LanguageModelChat[]> {
 
 interface ChatSession {
   id: string;
+  threadId: string;
   title: string;
+  selectedModelKey: string;
   transcript: Array<{ role: "user" | "assistant"; content: string }>;
   allowedTools: Set<string>;
 }
@@ -74,12 +110,13 @@ class DeepAgentsChatPanel {
   private readonly disposables: vscode.Disposable[] = [];
   private readonly workspaceRoot: string;
   private readonly models: vscode.LanguageModelChat[];
+  private readonly persistence: PersistenceService;
+  private readonly processInstanceId: string;
   private readonly sessions: ChatSession[] = [];
   private readonly toolCalls = new Map<
     string,
     { name: string; input: Record<string, unknown> }
   >();
-  private selectedModelKey: string;
   private currentSessionId: string;
   private cancellation: AbortController | undefined;
   private pendingApproval:
@@ -94,12 +131,18 @@ class DeepAgentsChatPanel {
   constructor(
     context: vscode.ExtensionContext,
     models: vscode.LanguageModelChat[],
+    persistence: PersistenceService,
+    processInstanceId: string,
     onDispose: () => void,
   ) {
     this.models = models;
-    this.selectedModelKey = modelKey(models[0]);
-    const initialSession = createSession();
-    this.sessions.push(initialSession);
+    this.persistence = persistence;
+    this.processInstanceId = processInstanceId;
+    this.sessions.push(...loadSessions(persistence, modelKey(models[0])));
+    if (this.sessions.length === 0) {
+      this.sessions.push(createSession(persistence, modelKey(models[0])));
+    }
+    const initialSession = this.sessions[0];
     this.currentSessionId = initialSession.id;
     this.workspaceRoot =
       vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
@@ -150,14 +193,33 @@ class DeepAgentsChatPanel {
     );
   }
 
-  private deleteSession(sessionId: string): void {
+  private get selectedModelKey(): string {
+    return this.activeSession.selectedModelKey;
+  }
+
+  private async deleteSession(sessionId: string): Promise<void> {
     const index = this.sessions.findIndex((session) => session.id === sessionId);
     if (index < 0) {
       return;
     }
-    this.sessions.splice(index, 1);
+    const [deleted] = this.sessions.splice(index, 1);
+    processAllowedToolsBySession.delete(sessionId);
+    this.persistence.sessions.markDeletingAndQueue(sessionId);
+    try {
+      await this.persistence.checkpointer.deleteThread(deleted.threadId);
+      this.persistence.sessions.hardDelete(sessionId);
+      this.persistence.checkpointCleanup.remove(deleted.threadId, "");
+    } catch (error) {
+      this.persistence.checkpointCleanup.markFailure(
+        deleted.threadId,
+        "",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
     if (this.sessions.length === 0) {
-      this.sessions.push(createSession());
+      this.sessions.push(
+        createSession(this.persistence, modelKey(this.models[0])),
+      );
     }
     if (this.currentSessionId === sessionId) {
       this.currentSessionId = this.sessions[Math.min(index, this.sessions.length - 1)].id;
@@ -188,13 +250,22 @@ class DeepAgentsChatPanel {
     }
     if (raw.type === "selectModel" && !this.running) {
       if (this.models.some((model) => modelKey(model) === raw.modelKey)) {
-        this.selectedModelKey = raw.modelKey;
+        this.activeSession.selectedModelKey = raw.modelKey;
+        this.persistence.sessions.setModel(this.activeSession.id, raw.modelKey);
+        this.persistence.conversationEvents.append({
+          sessionId: this.activeSession.id,
+          eventType: "model_changed",
+          payload: { schemaVersion: 1, modelKey: raw.modelKey },
+        });
         await this.postWorkbenchState(false);
       }
       return;
     }
     if (raw.type === "newSession" && !this.running) {
-      const session = createSession();
+      const session = createSession(
+        this.persistence,
+        this.activeSession.selectedModelKey,
+      );
       this.sessions.unshift(session);
       this.currentSessionId = session.id;
       await this.postWorkbenchState(true);
@@ -212,16 +283,25 @@ class DeepAgentsChatPanel {
       const title = sanitizeManualTitle(raw.title);
       if (session && title) {
         session.title = title;
+        this.persistence.sessions.rename(session.id, title);
+        this.persistence.conversationEvents.append({
+          sessionId: session.id,
+          eventType: "title_changed",
+          payload: { schemaVersion: 1, title },
+        });
         await this.postWorkbenchState(false);
       }
       return;
     }
     if (raw.type === "deleteSession" && !this.running) {
-      this.deleteSession(raw.sessionId);
+      await this.deleteSession(raw.sessionId);
       await this.postWorkbenchState(true);
       return;
     }
     if (raw.type === "clear" && !this.running) {
+      this.persistence.sessions.clear(this.activeSession.id);
+      const refreshed = this.persistence.sessions.get(this.activeSession.id);
+      if (refreshed) this.activeSession.threadId = refreshed.threadId;
       this.activeSession.transcript.length = 0;
       await this.postWorkbenchState(true);
       return;
@@ -245,6 +325,11 @@ class DeepAgentsChatPanel {
     const model = this.selectedModel;
     const isFirstMessage = session.transcript.length === 0;
     session.transcript.push({ role: "user", content: prompt });
+    this.persistence.conversationEvents.append({
+      sessionId: session.id,
+      eventType: "user_message",
+      payload: { schemaVersion: 1, content: prompt },
+    });
     if (isFirstMessage) {
       void this.generateSessionTitle(session.id, prompt, model);
     }
@@ -273,7 +358,7 @@ class DeepAgentsChatPanel {
       model: adapter,
       tools: [executeCommandTool],
       backend,
-      checkpointer: new MemorySaver(),
+      checkpointer: this.persistence.checkpointer,
       interruptOn: {
         write_file: {
           allowedDecisions: ["approve", "reject"],
@@ -308,15 +393,12 @@ class DeepAgentsChatPanel {
 
     try {
       const runConfig = {
-        configurable: { thread_id: crypto.randomUUID() },
+        configurable: { thread_id: session.threadId, checkpoint_ns: "" },
         signal: this.cancellation.signal,
       };
       let result = await agent.invoke(
         {
-          messages: session.transcript.map((message) => ({
-            role: message.role,
-            content: message.content,
-          })),
+          messages: [{ role: "user", content: prompt }],
         },
         runConfig,
       );
@@ -368,11 +450,23 @@ class DeepAgentsChatPanel {
       const finalMessage = [...messages].reverse().find((message) => AIMessage.isInstance(message));
       const finalText = finalMessage ? messageText(finalMessage.content) : streamedFinalText;
       session.transcript.push({ role: "assistant", content: finalText });
+      this.persistence.conversationEvents.append({
+        sessionId: session.id,
+        eventType: "assistant_message",
+        payload: { schemaVersion: 1, content: finalText },
+      });
       await this.post({ type: "runCompleted", text: finalText });
     } catch (error) {
       const cancelled = this.cancellation.signal.aborted;
       const message = cancelled ? "Cancelled." : formatError(error);
       session.transcript.push({ role: "assistant", content: message });
+      this.persistence.conversationEvents.append({
+        sessionId: session.id,
+        eventType: cancelled ? "run_cancelled" : "run_error",
+        payload: cancelled
+          ? { schemaVersion: 1, reason: message }
+          : { schemaVersion: 1, message },
+      });
       await this.post({
         type: "runFailed",
         message,
@@ -400,12 +494,37 @@ class DeepAgentsChatPanel {
       actions,
       allowSession,
     });
+    for (const action of actions) {
+      this.persistence.conversationEvents.append({
+        sessionId: this.activeSession.id,
+        eventType: "approval_requested",
+        payload: {
+          schemaVersion: 1,
+          requestId,
+          toolName: action.name,
+          input: action.args,
+        },
+      });
+    }
     const decision = await decisionPromise;
     await this.post({
       type: "approvalResolved",
       requestId,
       decision,
     });
+    for (const action of actions) {
+      this.persistence.conversationEvents.append({
+        sessionId: this.activeSession.id,
+        eventType: "approval_resolved",
+        payload: { schemaVersion: 1, requestId, decision },
+      });
+      this.persistence.approvals.record({
+        sessionId: this.activeSession.id,
+        toolName: action.name,
+        decision: decision === "deny" ? "deny" : decision,
+        processInstanceId: this.processInstanceId,
+      });
+    }
     return decision;
   }
 
@@ -454,12 +573,26 @@ class DeepAgentsChatPanel {
       const session = this.sessions.find((item) => item.id === sessionId);
       if (session && session.title === "New chat") {
         session.title = sanitizeGeneratedTitle(generated, firstMessage);
+        if (this.persistence.sessions.setGeneratedTitle(session.id, session.title)) {
+          this.persistence.conversationEvents.append({
+            sessionId: session.id,
+            eventType: "title_changed",
+            payload: { schemaVersion: 1, title: session.title },
+          });
+        }
         await this.postWorkbenchState(false);
       }
     } catch {
       const session = this.sessions.find((item) => item.id === sessionId);
       if (session && session.title === "New chat") {
         session.title = fallbackTitle(firstMessage);
+        if (this.persistence.sessions.setGeneratedTitle(session.id, session.title)) {
+          this.persistence.conversationEvents.append({
+            sessionId: session.id,
+            eventType: "title_changed",
+            payload: { schemaVersion: 1, title: session.title },
+          });
+        }
         await this.postWorkbenchState(false);
       }
     } finally {
@@ -495,6 +628,16 @@ class DeepAgentsChatPanel {
     } else if (event.kind === "toolCall") {
       const input = toRecord(event.input);
       this.toolCalls.set(event.id, { name: event.name, input });
+      this.persistence.conversationEvents.append({
+        sessionId: this.activeSession.id,
+        eventType: "tool_call",
+        payload: {
+          schemaVersion: 1,
+          toolCallId: event.id,
+          toolName: event.name,
+          input,
+        },
+      });
       await this.post({
         type: "toolCall",
         id: event.id,
@@ -509,6 +652,16 @@ class DeepAgentsChatPanel {
         : event.text.trimStart().startsWith("Error")
           ? "failed"
           : "completed";
+      this.persistence.conversationEvents.append({
+        sessionId: this.activeSession.id,
+        eventType: "tool_result",
+        payload: {
+          schemaVersion: 1,
+          toolCallId: event.id,
+          output: event.text.slice(0, 100_000),
+          truncated: event.text.length > 100_000,
+        },
+      });
       await this.post({
         type: "toolResult",
         id: event.id,
@@ -768,13 +921,55 @@ function toRecord(value: object): Record<string, unknown> {
   return Object.fromEntries(Object.entries(value));
 }
 
-function createSession(): ChatSession {
+function createSession(
+  persistence: PersistenceService,
+  selectedModelKey: string,
+): ChatSession {
+  const stored = persistence.sessions.create({ selectedModelKey });
   return {
-    id: crypto.randomUUID(),
-    title: "New chat",
+    id: stored.id,
+    threadId: stored.threadId,
+    title: stored.title,
+    selectedModelKey,
     transcript: [],
-    allowedTools: new Set(),
+    allowedTools: allowedToolsForSession(stored.id),
   };
+}
+
+function loadSessions(
+  persistence: PersistenceService,
+  fallbackModelKey: string,
+): ChatSession[] {
+  return persistence.sessions.list().map((session) => ({
+    id: session.id,
+    threadId: session.threadId,
+    title: session.title,
+    selectedModelKey: session.selectedModelKey ?? fallbackModelKey,
+    transcript: persistence.conversationEvents
+      .list(session.id)
+      .filter(
+        (event) =>
+          event.eventType === "user_message" ||
+          event.eventType === "assistant_message",
+      )
+      .map((event) => ({
+        role:
+          event.eventType === "user_message"
+            ? ("user" as const)
+            : ("assistant" as const),
+        content: String(event.payload.content),
+      })),
+    allowedTools: allowedToolsForSession(session.id),
+  }));
+}
+
+function allowedToolsForSession(sessionId: string): Set<string> {
+  let allowed = processAllowedToolsBySession.get(sessionId);
+  if (!allowed) {
+    allowed = new Set<string>();
+    processAllowedToolsBySession.set(sessionId, allowed);
+  }
+  return allowed;
 }
 
 function modelKey(model: vscode.LanguageModelChat): string {
@@ -1080,7 +1275,7 @@ function renderWebview(
         <button id="new-chat" type="button" title="New chat" aria-label="New chat">+</button>
       </div>
       <div id="session-list"></div>
-      <div class="sessions-foot">In-memory for this spike</div>
+      <div class="sessions-foot">Stored in this workspace</div>
     </aside>
     <section class="conversation">
       <header>
