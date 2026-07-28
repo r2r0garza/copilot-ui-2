@@ -8,6 +8,7 @@ const tests = [
   "command.integration",
   "sqliteCheckpointer.integration",
   "persistenceService.integration",
+  "repositories.integration",
 ];
 
 await esbuild.build({

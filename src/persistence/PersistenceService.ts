@@ -4,6 +4,13 @@ import { DatabaseSync } from "node:sqlite";
 import { NodeSqliteSaver } from "./NodeSqliteSaver";
 import { configureDatabase, isoNow } from "./database";
 import { applyMigrations } from "./migrations";
+import { ApprovalRepository } from "./ApprovalRepository";
+import { CheckpointCleanupRepository } from "./CheckpointCleanupRepository";
+import { ConversationEventRepository } from "./ConversationEventRepository";
+import { GoalRepository } from "./GoalRepository";
+import { RunRepository } from "./RunRepository";
+import { SessionRepository } from "./SessionRepository";
+import { ToolExecutionRepository } from "./ToolExecutionRepository";
 
 export interface UriLike {
   fsPath: string;
@@ -20,6 +27,13 @@ export class PersistenceInitializationError extends Error {
 export class PersistenceService {
   readonly database: DatabaseSync;
   readonly checkpointer: NodeSqliteSaver;
+  readonly sessions: SessionRepository;
+  readonly conversationEvents: ConversationEventRepository;
+  readonly goals: GoalRepository;
+  readonly runs: RunRepository;
+  readonly toolExecutions: ToolExecutionRepository;
+  readonly approvals: ApprovalRepository;
+  readonly checkpointCleanup: CheckpointCleanupRepository;
   readonly databasePath: string;
   private closed = false;
 
@@ -27,6 +41,13 @@ export class PersistenceService {
     this.database = database;
     this.databasePath = databasePath;
     this.checkpointer = new NodeSqliteSaver(database);
+    this.sessions = new SessionRepository(database);
+    this.conversationEvents = new ConversationEventRepository(database);
+    this.goals = new GoalRepository(database);
+    this.runs = new RunRepository(database);
+    this.toolExecutions = new ToolExecutionRepository(database);
+    this.approvals = new ApprovalRepository(database);
+    this.checkpointCleanup = new CheckpointCleanupRepository(database);
   }
 
   static async open(
