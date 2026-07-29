@@ -1,6 +1,6 @@
 # Persistence Foundation Plan
 
-**Status:** In progress  
+**Status:** Complete
 **Created:** 2026-07-28  
 **Scope:** Durable chat sessions now; crash-resumable goals and long-running work later  
 
@@ -15,7 +15,7 @@
 - [x] Plan 05.1 — run leases and heartbeats, startup recovery classification, session-scoped recovery cards, and durable side-effect reconciliation decisions.
 - [x] Plan 05.2 — exact tool-call ledger integration, durable terminal replay, input-integrity enforcement, effect classification, and uncertain-execution blocking.
 - [x] Plan 05.3 — process-scoped session grants, inert approval audit replay, and fresh-process continuation of checkpointed pending approvals.
-- [ ] Plan 06 — future-goal fixtures and operational hardening.
+- [x] Plan 06 — future-goal fixtures and operational hardening.
 
 ## Objective
 
