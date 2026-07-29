@@ -9,6 +9,7 @@ import {
 } from "../src/persistence/PersistenceService";
 import { configureDatabase } from "../src/persistence/database";
 import {
+  APP_MIGRATIONS,
   applyMigrations,
   type Migration,
 } from "../src/persistence/migrations";
@@ -41,6 +42,14 @@ async function main(): Promise<void> {
           version: 2,
           name: "recovery_reconciliation",
         },
+        {
+          version: 3,
+          name: "session_agent_selection",
+        },
+        {
+          version: 4,
+          name: "steering_conversation_events",
+        },
       ],
     );
     assert.throws(() => {
@@ -66,7 +75,7 @@ async function main(): Promise<void> {
           .prepare("SELECT COUNT(*) AS count FROM app_migrations")
           .get() as { count: number }
       ).count,
-      2,
+      4,
     );
     second.database
       .prepare(`
@@ -119,12 +128,103 @@ async function main(): Promise<void> {
       1,
     );
     rollbackDatabase.close();
+
+    const upgradePath = join(root, "upgrade.sqlite");
+    const upgradeDatabase = new DatabaseSync(upgradePath);
+    configureDatabase(upgradeDatabase);
+    applyMigrations(upgradeDatabase, APP_MIGRATIONS.slice(0, 3));
+    upgradeDatabase
+      .prepare(`
+        INSERT INTO chat_sessions (
+          id,
+          thread_id,
+          checkpoint_ns,
+          title,
+          title_source,
+          status,
+          created_at,
+          updated_at,
+          last_event_at
+        ) VALUES (
+          'upgrade-session',
+          'upgrade-thread',
+          '',
+          'Upgrade fixture',
+          'default',
+          'active',
+          'now',
+          'now',
+          'now'
+        )
+      `)
+      .run();
+    upgradeDatabase
+      .prepare(`
+        INSERT INTO conversation_events (
+          id,
+          session_id,
+          sequence,
+          event_type,
+          payload_json,
+          created_at
+        ) VALUES (
+          'old-event',
+          'upgrade-session',
+          1,
+          'user_message',
+          '{"schemaVersion":1,"content":"before upgrade"}',
+          'now'
+        )
+      `)
+      .run();
+
+    applyMigrations(upgradeDatabase);
+    assert.equal(
+      (
+        upgradeDatabase
+          .prepare(
+            "SELECT COUNT(*) AS count FROM conversation_events WHERE id = 'old-event'",
+          )
+          .get() as { count: number }
+      ).count,
+      1,
+    );
+    upgradeDatabase
+      .prepare(`
+        INSERT INTO conversation_events (
+          id,
+          session_id,
+          sequence,
+          event_type,
+          payload_json,
+          created_at
+        ) VALUES (
+          'steering-event',
+          'upgrade-session',
+          2,
+          'steering_message',
+          '{"schemaVersion":1,"steeringId":"steer-1","content":"after upgrade"}',
+          'now'
+        )
+      `)
+      .run();
+    assert.equal(
+      (
+        upgradeDatabase
+          .prepare(
+            "SELECT COUNT(*) AS count FROM conversation_events WHERE session_id = 'upgrade-session'",
+          )
+          .get() as { count: number }
+      ).count,
+      2,
+    );
+    upgradeDatabase.close();
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 
   console.log(
-    "Persistence service integration test passed: migrations are idempotent, foreign keys enforced, future schemas rejected, and failed migrations rolled back",
+    "Persistence service integration test passed: migrations are idempotent and upgrade safely, foreign keys enforced, future schemas rejected, and failed migrations rolled back",
   );
 }
 

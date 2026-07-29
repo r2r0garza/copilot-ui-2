@@ -7,6 +7,9 @@ export type ConversationEventType =
   | "tool_result"
   | "approval_requested"
   | "approval_resolved"
+  | "steering_message"
+  | "steering_injected"
+  | "steering_discarded"
   | "run_error"
   | "run_cancelled"
   | "model_changed"
@@ -19,6 +22,7 @@ export interface ChatSession {
   title: string;
   titleSource: TitleSource;
   selectedModelKey: string | null;
+  selectedAgentId: string | null;
   status: SessionStatus;
   createdAt: string;
   updatedAt: string;
@@ -49,6 +53,9 @@ const REQUIRED_STRING_FIELDS: Partial<
   tool_result: ["toolCallId"],
   approval_requested: ["requestId", "toolName"],
   approval_resolved: ["requestId", "decision"],
+  steering_message: ["steeringId", "content"],
+  steering_injected: ["steeringId"],
+  steering_discarded: ["steeringId", "reason"],
   run_error: ["message"],
   model_changed: ["modelKey"],
   title_changed: ["title"],

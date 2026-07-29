@@ -10,6 +10,7 @@ interface SessionRow {
   title: string;
   title_source: TitleSource;
   selected_model_key: string | null;
+  selected_agent_id: string | null;
   status: SessionStatus;
   created_at: string;
   updated_at: string;
@@ -24,6 +25,7 @@ function fromRow(row: SessionRow): ChatSession {
     title: row.title,
     titleSource: row.title_source,
     selectedModelKey: row.selected_model_key,
+    selectedAgentId: row.selected_agent_id,
     status: row.status,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -39,6 +41,7 @@ export class SessionRepository {
     threadId?: string;
     title?: string;
     selectedModelKey?: string | null;
+    selectedAgentId?: string | null;
   } = {}): ChatSession {
     const now = isoNow();
     const session: ChatSession = {
@@ -48,6 +51,7 @@ export class SessionRepository {
       title: input.title ?? "New chat",
       titleSource: "default",
       selectedModelKey: input.selectedModelKey ?? null,
+      selectedAgentId: input.selectedAgentId ?? null,
       status: "active",
       createdAt: now,
       updatedAt: now,
@@ -56,11 +60,13 @@ export class SessionRepository {
     this.database.prepare(`
       INSERT INTO chat_sessions (
         id, thread_id, checkpoint_ns, title, title_source,
-        selected_model_key, status, created_at, updated_at, last_event_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        selected_model_key, selected_agent_id, status, created_at, updated_at,
+        last_event_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       session.id, session.threadId, session.checkpointNamespace, session.title,
-      session.titleSource, session.selectedModelKey, session.status,
+      session.titleSource, session.selectedModelKey, session.selectedAgentId,
+      session.status,
       session.createdAt, session.updatedAt, session.lastEventAt,
     );
     return session;
@@ -103,6 +109,14 @@ export class SessionRepository {
       SET selected_model_key = ?, updated_at = ?
       WHERE id = ?
     `).run(modelKey, isoNow(), id);
+  }
+
+  setAgent(id: string, agentId: string | null): void {
+    this.database.prepare(`
+      UPDATE chat_sessions
+      SET selected_agent_id = ?, updated_at = ?
+      WHERE id = ?
+    `).run(agentId, isoNow(), id);
   }
 
   markDeletingAndQueue(id: string): void {

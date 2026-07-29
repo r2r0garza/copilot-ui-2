@@ -20,6 +20,7 @@ async function main(): Promise<void> {
       id: "session-1",
       threadId: "thread-1",
       selectedModelKey: "copilot/model-a",
+      selectedAgentId: "writer",
     });
     service.sessions.create({ id: "session-2", threadId: "thread-2" });
     service.sessions.rename(first.id, "Manual title");
@@ -28,6 +29,9 @@ async function main(): Promise<void> {
       false,
     );
     assert.equal(service.sessions.get(first.id)?.title, "Manual title");
+    assert.equal(service.sessions.get(first.id)?.selectedAgentId, "writer");
+    service.sessions.setAgent(first.id, "coder");
+    assert.equal(service.sessions.get(first.id)?.selectedAgentId, "coder");
 
     service.conversationEvents.append({
       sessionId: first.id,
@@ -48,9 +52,36 @@ async function main(): Promise<void> {
         payload: { schemaVersion: 1, reason: `fixture-${index}` },
       });
     }
+    service.conversationEvents.append({
+      sessionId: first.id,
+      eventType: "steering_message",
+      payload: {
+        schemaVersion: 1,
+        steeringId: "steer-1",
+        content: "Persist this steering update.",
+      },
+    });
+    service.conversationEvents.append({
+      sessionId: first.id,
+      eventType: "steering_injected",
+      payload: {
+        schemaVersion: 1,
+        steeringId: "steer-1",
+        boundary: 1,
+      },
+    });
+    service.conversationEvents.append({
+      sessionId: first.id,
+      eventType: "steering_discarded",
+      payload: {
+        schemaVersion: 1,
+        steeringId: "steer-2",
+        reason: "cancelled",
+      },
+    });
     assert.deepEqual(
       service.conversationEvents.list(first.id).map((event) => event.sequence),
-      Array.from({ length: 22 }, (_, index) => index + 1),
+      Array.from({ length: 25 }, (_, index) => index + 1),
     );
     assert.equal(service.sessions.list()[0].id, first.id);
 
@@ -109,6 +140,7 @@ async function main(): Promise<void> {
       service.sessions.get(first.id)?.selectedModelKey,
       "copilot/model-a",
     );
+    assert.equal(service.sessions.get(first.id)?.selectedAgentId, "coder");
     assert.equal(service.approvals.countForSession(first.id), 1);
     assert.equal(service.checkpointCleanup.list()[0].threadId, "thread-1");
 

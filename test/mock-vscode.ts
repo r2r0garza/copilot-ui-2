@@ -2,6 +2,14 @@ export class LanguageModelTextPart {
   constructor(public value: string) {}
 }
 
+export class LanguageModelPromptTsxPart {
+  constructor(public value: unknown) {}
+}
+
+export class LanguageModelToolResult {
+  constructor(public content: unknown[]) {}
+}
+
 export class LanguageModelToolCallPart {
   constructor(
     public callId: string,
@@ -28,10 +36,57 @@ export class LanguageModelChatMessage {
 }
 
 export class CancellationTokenSource {
-  readonly token = {};
-  cancel() {}
-  dispose() {}
+  private readonly listeners = new Set<() => void>();
+  private cancelled = false;
+  readonly token = {
+    get isCancellationRequested() {
+      return this.source.cancelled;
+    },
+    onCancellationRequested: (listener: () => void) => {
+      this.listeners.add(listener);
+      return { dispose: () => this.listeners.delete(listener) };
+    },
+    source: this,
+  };
+
+  cancel() {
+    if (this.cancelled) {
+      return;
+    }
+    this.cancelled = true;
+    for (const listener of this.listeners) {
+      listener();
+    }
+  }
+
+  dispose() {
+    this.listeners.clear();
+  }
 }
+
+export class CancellationError extends Error {}
+
+export const lm: {
+  tools: Array<{
+    name: string;
+    description: string;
+    inputSchema?: object;
+    tags: string[];
+  }>;
+  invokeTool: (
+    name: string,
+    options: unknown,
+    token?: unknown,
+  ) => Promise<LanguageModelToolResult>;
+} = {
+  tools: [],
+  async invokeTool(name) {
+    throw new Error(`No mock implementation for ${name}`);
+  },
+};
+
+export const extensions: { all: unknown[] } = { all: [] };
+export const version = "1.105.0-test";
 
 export const LanguageModelChatToolMode = {
   Auto: 1,

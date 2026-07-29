@@ -254,6 +254,70 @@ export const APP_MIGRATIONS: readonly Migration[] = [
         ON recovery_reconciliations(run_id, created_at);
     `,
   },
+  {
+    version: 3,
+    name: "session_agent_selection",
+    sql: `
+      ALTER TABLE chat_sessions
+        ADD COLUMN selected_agent_id TEXT;
+    `,
+  },
+  {
+    version: 4,
+    name: "steering_conversation_events",
+    sql: `
+      CREATE TABLE conversation_events_next (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+        run_id TEXT,
+        sequence INTEGER NOT NULL,
+        event_type TEXT NOT NULL CHECK (
+          event_type IN (
+            'user_message',
+            'assistant_message',
+            'tool_call',
+            'tool_result',
+            'approval_requested',
+            'approval_resolved',
+            'run_error',
+            'run_cancelled',
+            'model_changed',
+            'title_changed',
+            'steering_message',
+            'steering_injected',
+            'steering_discarded'
+          )
+        ),
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (session_id, sequence)
+      );
+
+      INSERT INTO conversation_events_next (
+        id,
+        session_id,
+        run_id,
+        sequence,
+        event_type,
+        payload_json,
+        created_at
+      )
+      SELECT
+        id,
+        session_id,
+        run_id,
+        sequence,
+        event_type,
+        payload_json,
+        created_at
+      FROM conversation_events;
+
+      DROP TABLE conversation_events;
+      ALTER TABLE conversation_events_next RENAME TO conversation_events;
+      CREATE INDEX conversation_events_session_sequence_idx
+        ON conversation_events(session_id, sequence);
+    `,
+  },
 ];
 
 export function applyMigrations(

@@ -1,13 +1,23 @@
 import * as vscode from "vscode";
+import { relative } from "node:path";
 import { AIMessage, ToolMessage } from "@langchain/core/messages";
 import { Command } from "@langchain/langgraph";
-import { createDeepAgent, FilesystemBackend } from "deepagents";
+import {
+  createDeepAgent,
+  createSubAgentMiddleware,
+  FilesystemBackend,
+  type CompiledSubAgent,
+} from "deepagents";
 import {
   createExecuteCommandTool,
   validateExecuteCommandInput,
 } from "./executeCommandTool";
 import { WorkbenchSidebarProvider } from "./sidebarProvider";
-import { VsCodeChatModel, type AdapterEvent } from "./vscodeChatModel";
+import {
+  VsCodeChatModel,
+  type AdapterEvent,
+  type ModelPromptSnapshot,
+} from "./vscodeChatModel";
 import { PersistenceService } from "./persistence/PersistenceService";
 import {
   projectConversationEvents,
@@ -20,27 +30,69 @@ import {
   encodeToolResult,
   hashToolInput,
 } from "./toolExecutionLedger";
+import {
+  discoverProjectCustomizations,
+  type ProjectAgentDefinition,
+  type ProjectCustomizations,
+} from "./projectCustomizations";
+import {
+  createAgentToolPolicyMiddleware,
+  resolveAgentToolPolicy,
+  type AgentToolPolicy,
+} from "./agentToolPolicy";
+import { ProjectAgentRegistry } from "./projectAgentRegistry";
+import {
+  createProjectAgentDelegationGuardMiddleware,
+  PROJECT_AGENT_DELEGATION_SYSTEM_PROMPT,
+  PROJECT_AGENT_TASK_DESCRIPTION,
+  resolveProjectAgentDelegation,
+} from "./projectAgentDelegation";
+import { configureDeepAgentSystemPrompt } from "./deepAgentSystemPrompt";
+import { createProjectSkillsMiddleware } from "./projectSkillsMiddleware";
+import {
+  renderRegisteredLanguageModelToolInventory,
+  snapshotRegisteredLanguageModelTools,
+} from "./vscodeLanguageModelTools";
+import {
+  createAllowedVscodeMcpTools,
+  resolveVscodeMcpTools,
+} from "./vscodeMcpTools";
+import {
+  createAllowedVscodeWebBrowserTools,
+  resolveVscodeWebBrowserTools,
+} from "./vscodeWebBrowserTools";
+import { resolveComposerControlState } from "./composerState";
+import {
+  createSteeringMiddleware,
+  pendingSteeringEntriesFromEvents,
+  SteeringQueue,
+  type SteeringEntry,
+  type SteeringInjection,
+} from "./steeringQueue";
+import { createRepeatedToolFailureMiddleware } from "./repeatedToolFailure";
+import {
+  collectRuntimeDiagnostics,
+  renderRuntimeDiagnostics,
+} from "./runtimeDiagnostics";
 
 let currentPanel: DeepAgentsChatPanel | undefined;
 const processAllowedTools = new Map<string, Set<string>>();
 const RUN_LEASE_MS = 30_000;
 const RUN_HEARTBEAT_MS = 10_000;
-const AGENT_SYSTEM_PROMPT = [
-  "You are a coding agent running inside VS Code.",
-  "The virtual filesystem root / is the current VS Code workspace.",
-  "Use your filesystem, planning, and execute_command tools when they help answer the user.",
-  "Inspect before editing, keep changes scoped, and clearly summarize any files changed.",
-  "File writes and edits require user approval unless allowed for this chat session.",
-  "execute_command requires user approval unless allowed for this chat session. Pass an executable and argument array; shell syntax is not interpreted.",
-  "When a tool requires approval, call it immediately. Never ask for permission in conversational text; the host application owns the approval interaction.",
-  "Never use '..', '~', home-directory variables, or absolute paths outside the workspace in command arguments; they are rejected.",
-  "For commands targeting the workspace root, omit the path argument or use '.' exactly. After a path guard rejection, do not try alternate forms such as /, /root, ~, or environment variables. Retry at most once with '.' or no path; if that cannot satisfy the request, explain the restriction and stop.",
-  "When the user requests command output, include the relevant stdout or stderr in your final response instead of only saying the command ran.",
-].join("\n");
+const INCLUDE_DEEPAGENTS_DEFAULT_SYSTEM_PROMPT = false;
 
 export function activate(context: vscode.ExtensionContext): void {
   let persistence: PersistenceService | undefined;
   const processInstanceId = crypto.randomUUID();
+  const customizationsOutput = vscode.window.createOutputChannel(
+    "Deep Agents Customizations",
+  );
+  const modelCallsOutput = vscode.window.createOutputChannel(
+    "Deep Agents Model Calls",
+  );
+  const runtimeToolsOutput = vscode.window.createOutputChannel(
+    "Deep Agents Runtime Tools",
+  );
   const openWorkbench = async (): Promise<void> => {
     if (currentPanel) {
       currentPanel.reveal();
@@ -80,28 +132,200 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }
 
-    currentPanel = new DeepAgentsChatPanel(
-      context,
-      models,
-      persistence,
-      processInstanceId,
-      () => {
-        currentPanel = undefined;
-      },
-    );
+    try {
+      const customizations = await discoverProjectCustomizations(
+        workspaceUri.fsPath,
+      );
+      currentPanel = new DeepAgentsChatPanel(
+        context,
+        models,
+        persistence,
+        processInstanceId,
+        workspaceUri.fsPath,
+        customizations,
+        modelCallsOutput,
+        () => {
+          currentPanel = undefined;
+        },
+      );
+    } catch (error) {
+      void vscode.window.showErrorMessage(
+        `Unable to load project agents: ${formatError(error)}`,
+      );
+    }
   };
 
   context.subscriptions.push(
     vscode.commands.registerCommand("deepagentsSpike.openChat", openWorkbench),
+    vscode.commands.registerCommand(
+      "deepagentsSpike.inspectProjectCustomizations",
+      async () => {
+        const workspaceRoot =
+          vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        if (!workspaceRoot) {
+          void vscode.window.showErrorMessage(
+            "Open a workspace before inspecting Deep Agents customizations.",
+          );
+          return;
+        }
+
+        try {
+          const discovered =
+            await discoverProjectCustomizations(workspaceRoot);
+          renderProjectCustomizations(customizationsOutput, discovered);
+          customizationsOutput.show(true);
+        } catch (error) {
+          void vscode.window.showErrorMessage(
+            `Unable to inspect project customizations: ${formatError(error)}`,
+          );
+        }
+      },
+    ),
+    vscode.commands.registerCommand(
+      "deepagentsSpike.inspectRegisteredTools",
+      () => {
+        runtimeToolsOutput.clear();
+        runtimeToolsOutput.appendLine(
+          renderRegisteredLanguageModelToolInventory(
+            snapshotRegisteredLanguageModelTools(),
+          ),
+        );
+        runtimeToolsOutput.show(true);
+      },
+    ),
+    vscode.commands.registerCommand(
+      "deepagentsSpike.inspectRuntimeDiagnostics",
+      async () => {
+        const workspaceRoot =
+          vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        if (!workspaceRoot) {
+          void vscode.window.showErrorMessage(
+            "Open a workspace before inspecting Deep Agents runtime diagnostics.",
+          );
+          return;
+        }
+        try {
+          const [models, customizations] = await Promise.all([
+            vscode.lm.selectChatModels({ vendor: "copilot" }),
+            discoverProjectCustomizations(workspaceRoot),
+          ]);
+          runtimeToolsOutput.clear();
+          runtimeToolsOutput.appendLine(
+            renderRuntimeDiagnostics(
+              collectRuntimeDiagnostics({
+                models,
+                registeredTools: vscode.lm.tools,
+                extensions: vscode.extensions.all,
+                vscodeVersion: vscode.version,
+                mcpConfiguration: customizations.mcp,
+              }),
+            ),
+          );
+          runtimeToolsOutput.show(true);
+        } catch (error) {
+          void vscode.window.showErrorMessage(
+            `Unable to inspect runtime diagnostics: ${formatError(error)}`,
+          );
+        }
+      },
+    ),
     vscode.window.registerWebviewViewProvider(
       WorkbenchSidebarProvider.viewType,
       new WorkbenchSidebarProvider(openWorkbench),
       { webviewOptions: { retainContextWhenHidden: true } },
     ),
+    customizationsOutput,
+    modelCallsOutput,
+    runtimeToolsOutput,
   );
 }
 
 export function deactivate(): void {}
+
+function renderProjectCustomizations(
+  output: vscode.OutputChannel,
+  discovered: ProjectCustomizations,
+): void {
+  output.clear();
+  output.appendLine(`Workspace: ${discovered.workspaceRoot}`);
+  output.appendLine("");
+  const serverNames = Object.keys(discovered.mcp?.servers ?? {}).sort();
+  const policyDiagnosticLines: string[] = [];
+  output.appendLine(`Agents (${discovered.agents.length})`);
+  for (const agent of discovered.agents) {
+    const configuredTools =
+      agent.tools === undefined ? "<omitted>" : JSON.stringify(agent.tools);
+    const policy = resolveAgentToolPolicy(agent.tools, {
+      mcpServerNames: serverNames,
+    });
+    output.appendLine(
+      `- ${agent.name} [${agent.id}] configured=${configuredTools} resolved=${JSON.stringify(policy.resolvedTools)} children=${JSON.stringify(resolveProjectAgentDelegation(agent, discovered).children.map((child) => child.id))}`,
+    );
+    for (const diagnostic of policy.diagnostics) {
+      policyDiagnosticLines.push(
+        `- ${diagnostic.severity.toUpperCase()} ${relative(discovered.workspaceRoot, agent.filePath)} [${diagnostic.code}] ${diagnostic.message}`,
+      );
+    }
+    for (const diagnostic of resolveProjectAgentDelegation(agent, discovered)
+      .diagnostics) {
+      policyDiagnosticLines.push(
+        `- ${diagnostic.severity.toUpperCase()} ${relative(discovered.workspaceRoot, agent.filePath)} [${diagnostic.code}] ${diagnostic.message}`,
+      );
+    }
+  }
+  output.appendLine("");
+  output.appendLine(`Skills (${discovered.skills.length})`);
+  for (const skill of discovered.skills) {
+    output.appendLine(`- ${skill.name}: ${skill.description}`);
+  }
+  output.appendLine("");
+  output.appendLine(`MCP servers (${serverNames.length})`);
+  for (const serverName of serverNames) {
+    const source = discovered.mcp?.sources[serverName];
+    const sourcePath = source
+      ? relative(discovered.workspaceRoot, source.filePath)
+      : "<unknown>";
+    output.appendLine(`- ${serverName} (${sourcePath})`);
+  }
+  const runtimeMcp = resolveVscodeMcpTools(discovered.mcp);
+  output.appendLine("");
+  output.appendLine(`MCP runtime tools (${runtimeMcp.tools.length})`);
+  for (const tool of runtimeMcp.tools) {
+    output.appendLine(`- ${tool.canonicalName} -> ${tool.providerName}`);
+  }
+  for (const diagnostic of runtimeMcp.diagnostics) {
+    policyDiagnosticLines.push(
+      `- ${diagnostic.severity.toUpperCase()} [${diagnostic.code}] ${diagnostic.message}`,
+    );
+  }
+  const runtimeWebBrowser = resolveVscodeWebBrowserTools();
+  output.appendLine("");
+  output.appendLine(
+    `Web/browser runtime tools (${runtimeWebBrowser.tools.length})`,
+  );
+  for (const tool of runtimeWebBrowser.tools) {
+    output.appendLine(
+      `- ${tool.canonicalName} -> ${tool.providerName}${tool.requiresApproval ? " (approval required)" : ""}`,
+    );
+  }
+  for (const diagnostic of runtimeWebBrowser.diagnostics) {
+    policyDiagnosticLines.push(
+      `- ${diagnostic.severity.toUpperCase()} [${diagnostic.code}] ${diagnostic.message}`,
+    );
+  }
+  output.appendLine("");
+  output.appendLine(
+    `Diagnostics (${discovered.diagnostics.length + policyDiagnosticLines.length})`,
+  );
+  for (const diagnostic of discovered.diagnostics) {
+    output.appendLine(
+      `- ${diagnostic.severity.toUpperCase()} ${diagnostic.path} [${diagnostic.code}] ${diagnostic.message}`,
+    );
+  }
+  for (const diagnosticLine of policyDiagnosticLines) {
+    output.appendLine(diagnosticLine);
+  }
+}
 
 async function selectCopilotModels(): Promise<vscode.LanguageModelChat[]> {
   const family = vscode.workspace
@@ -130,6 +354,7 @@ interface ChatSession {
   threadId: string;
   title: string;
   selectedModelKey: string;
+  selectedAgentId: string | null;
   transcript: Array<{ role: "user" | "assistant"; content: string }>;
   allowedTools: Set<string>;
 }
@@ -141,6 +366,9 @@ class DeepAgentsChatPanel {
   private readonly models: vscode.LanguageModelChat[];
   private readonly persistence: PersistenceService;
   private readonly processInstanceId: string;
+  private readonly modelCallsOutput: vscode.OutputChannel;
+  private customizations: ProjectCustomizations;
+  private agentRegistry: ProjectAgentRegistry;
   private readonly sessions: ChatSession[] = [];
   private readonly toolCalls = new Map<
     string,
@@ -156,17 +384,31 @@ class DeepAgentsChatPanel {
       }
     | undefined;
   private running = false;
+  private activeSteering:
+    | {
+        runId: string;
+        sessionId: string;
+        queue: SteeringQueue;
+      }
+    | undefined;
 
   constructor(
     context: vscode.ExtensionContext,
     models: vscode.LanguageModelChat[],
     persistence: PersistenceService,
     processInstanceId: string,
+    workspaceRoot: string,
+    customizations: ProjectCustomizations,
+    modelCallsOutput: vscode.OutputChannel,
     onDispose: () => void,
   ) {
     this.models = models;
     this.persistence = persistence;
     this.processInstanceId = processInstanceId;
+    this.workspaceRoot = workspaceRoot;
+    this.customizations = customizations;
+    this.agentRegistry = new ProjectAgentRegistry(customizations);
+    this.modelCallsOutput = modelCallsOutput;
     this.sessions.push(
       ...loadSessions(persistence, modelKey(models[0]), processInstanceId),
     );
@@ -177,8 +419,6 @@ class DeepAgentsChatPanel {
     }
     const initialSession = this.sessions[0];
     this.currentSessionId = initialSession.id;
-    this.workspaceRoot =
-      vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
     this.panel = vscode.window.createWebviewPanel(
       "deepagentsSpike.chat",
       "Deep Agents Spike",
@@ -286,6 +526,50 @@ class DeepAgentsChatPanel {
       this.resolvePendingApproval("deny");
       return;
     }
+    if (raw.type === "steer") {
+      const active = this.activeSteering;
+      const text = raw.text.trim();
+      if (
+        !this.running ||
+        !active ||
+        active.sessionId !== this.activeSession.id ||
+        !text
+      ) {
+        await this.post({
+          type: "steeringRejected",
+          requestId: raw.requestId,
+          reason: "No active run can accept this steering message.",
+        });
+        return;
+      }
+      const result = active.queue.enqueue(raw.requestId, text);
+      if (result.kind === "closed") {
+        await this.post({
+          type: "steeringRejected",
+          requestId: raw.requestId,
+          reason: "The active run has already reached its final model boundary.",
+        });
+        return;
+      }
+      if (result.kind === "accepted") {
+        this.persistence.conversationEvents.append({
+          sessionId: active.sessionId,
+          runId: active.runId,
+          eventType: "steering_message",
+          payload: {
+            schemaVersion: 1,
+            steeringId: result.entry.id,
+            content: result.entry.text,
+          },
+        });
+      }
+      await this.post({
+        type: "steeringAccepted",
+        requestId: result.entry.id,
+        text: result.entry.text,
+      });
+      return;
+    }
     if (raw.type === "approval") {
       if (this.pendingApproval?.requestId === raw.requestId) {
         if (raw.decision === "session" && !this.pendingApproval.allowSession) {
@@ -349,6 +633,20 @@ class DeepAgentsChatPanel {
           eventType: "model_changed",
           payload: { schemaVersion: 1, modelKey: raw.modelKey },
         });
+        await this.postWorkbenchState(false);
+      }
+      return;
+    }
+    if (raw.type === "selectAgent" && !this.running) {
+      const agentId = raw.agentId || null;
+      if (
+        agentId === null ||
+        this.agentRegistry
+          .listUserInvocable()
+          .some((agent) => agent.id === agentId)
+      ) {
+        this.activeSession.selectedAgentId = agentId;
+        this.persistence.sessions.setAgent(this.activeSession.id, agentId);
         await this.postWorkbenchState(false);
       }
       return;
@@ -423,6 +721,14 @@ class DeepAgentsChatPanel {
   }
 
   private async run(prompt: string): Promise<void> {
+    const selectedAgent = await this.resolveSelectedAgentForRun();
+    if (!selectedAgent) {
+      await this.post({
+        type: "runFailed",
+        message: "Select an agent before sending a message.",
+      });
+      return;
+    }
     this.running = true;
     this.cancellation = new AbortController();
     this.toolCalls.clear();
@@ -437,6 +743,10 @@ class DeepAgentsChatPanel {
       leaseExpiresAt: leaseExpiration(),
       compatibilityVersion: CURRENT_GRAPH_COMPATIBILITY_VERSION,
     });
+    const steeringQueue = this.activateSteeringQueue(
+      runId,
+      session.id,
+    );
     const heartbeat = setInterval(() => {
       try {
         this.persistence.runs.heartbeat(attemptId, leaseExpiration());
@@ -463,6 +773,14 @@ class DeepAgentsChatPanel {
     let streamedFinalText = "";
     const adapter = new VsCodeChatModel({
       model,
+      onPrompt: (snapshot) =>
+        this.logModelPrompt(
+          snapshot,
+          runId,
+          session,
+          selectedAgent.id,
+          model,
+        ),
       onEvent: (event) => {
         if (event.kind === "text") {
           streamedFinalText += event.text;
@@ -471,7 +789,13 @@ class DeepAgentsChatPanel {
       },
     });
 
-    const agent = this.createAgent(adapter, session, runId);
+    const agent = this.createAgent(
+      adapter,
+      session,
+      runId,
+      selectedAgent,
+      steeringQueue,
+    );
 
     try {
       const runConfig = {
@@ -486,19 +810,45 @@ class DeepAgentsChatPanel {
       );
       await this.recordLatestCheckpoint(runId, session);
 
-      let approvalRequest = extractApprovalRequest(result);
-      while (approvalRequest) {
-        const actions = approvalRequest.actions;
-        const decisions = await this.reviewApprovalActions(
-          actions,
-          runId,
-          session,
-        );
-        const resume = { decisions };
-        result = await agent.invoke(new Command({ resume }), runConfig);
-        this.persistence.runs.setExecutionStatus(runId, "running");
+      while (true) {
+        let approvalRequest = extractApprovalRequest(result);
+        while (approvalRequest) {
+          const actions = approvalRequest.actions;
+          const decisions = await this.reviewApprovalActions(
+            actions,
+            runId,
+            session,
+          );
+          const resume = { decisions };
+          result = await agent.invoke(new Command({ resume }), runConfig);
+          this.persistence.runs.setExecutionStatus(runId, "running");
+          await this.recordLatestCheckpoint(runId, session);
+          approvalRequest = extractApprovalRequest(result);
+        }
+        if (steeringQueue.closeIfEmpty()) {
+          break;
+        }
+        const intermediateMessage = [...(result.messages ?? [])]
+          .reverse()
+          .find((message) => AIMessage.isInstance(message));
+        const intermediateText = intermediateMessage
+          ? messageText(intermediateMessage.content)
+          : "";
+        if (intermediateText) {
+          session.transcript.push({
+            role: "assistant",
+            content: intermediateText,
+          });
+          this.persistence.conversationEvents.append({
+            sessionId: session.id,
+            runId,
+            eventType: "assistant_message",
+            payload: { schemaVersion: 1, content: intermediateText },
+          });
+        }
+        await this.post({ type: "modelBoundary" });
+        result = await agent.invoke({ messages: [] }, runConfig);
         await this.recordLatestCheckpoint(runId, session);
-        approvalRequest = extractApprovalRequest(result);
       }
 
       const messages = result.messages ?? [];
@@ -516,6 +866,10 @@ class DeepAgentsChatPanel {
     } catch (error) {
       const cancelled = this.cancellation.signal.aborted;
       const message = cancelled ? "Cancelled." : formatError(error);
+      await this.discardSteeringQueue(
+        runId,
+        cancelled ? "cancelled" : "failed",
+      );
       session.transcript.push({ role: "assistant", content: message });
       this.persistence.conversationEvents.append({
         sessionId: session.id,
@@ -539,6 +893,7 @@ class DeepAgentsChatPanel {
       clearInterval(heartbeat);
       this.running = false;
       this.cancellation = undefined;
+      this.clearSteeringQueue(runId);
     }
   }
 
@@ -548,6 +903,14 @@ class DeepAgentsChatPanel {
       .listForSession(session.id)
       .find((item) => item.run.id === runId);
     if (!recovery || recovery.recoveryClass !== "waiting_for_approval") {
+      return;
+    }
+    const selectedAgent = await this.resolveSelectedAgentForRun();
+    if (!selectedAgent) {
+      await this.post({
+        type: "runFailed",
+        message: "Select the original agent before resuming this run.",
+      });
       return;
     }
 
@@ -575,6 +938,11 @@ class DeepAgentsChatPanel {
         leaseExpiresAt: leaseExpiration(),
         allowedRecoveryClasses: ["waiting_for_approval"],
       });
+      const steeringQueue = this.activateSteeringQueue(
+        runId,
+        session.id,
+        this.restorePendingSteering(runId, session.id),
+      );
       attemptId = resumed.attemptId;
       heartbeat = setInterval(() => {
         try {
@@ -605,6 +973,14 @@ class DeepAgentsChatPanel {
       let streamedFinalText = "";
       const adapter = new VsCodeChatModel({
         model,
+        onPrompt: (snapshot) =>
+          this.logModelPrompt(
+            snapshot,
+            runId,
+            session,
+            selectedAgent.id,
+            model,
+          ),
         onEvent: (event) => {
           if (event.kind === "text") {
             streamedFinalText += event.text;
@@ -612,7 +988,13 @@ class DeepAgentsChatPanel {
           void this.postAdapterEvent(event, runId, session.id);
         },
       });
-      const agent = this.createAgent(adapter, session, runId);
+      const agent = this.createAgent(
+        adapter,
+        session,
+        runId,
+        selectedAgent,
+        steeringQueue,
+      );
       const runConfig = {
         configurable: {
           thread_id: resumed.run.threadId,
@@ -641,20 +1023,46 @@ class DeepAgentsChatPanel {
       this.persistence.runs.setExecutionStatus(runId, "running");
       await this.recordLatestCheckpoint(runId, session);
 
-      let nextApproval = extractApprovalRequest(result);
-      while (nextApproval) {
-        const nextDecisions = await this.reviewApprovalActions(
-          nextApproval.actions,
-          runId,
-          session,
-        );
-        result = await agent.invoke(
-          new Command({ resume: { decisions: nextDecisions } }),
-          runConfig,
-        );
-        this.persistence.runs.setExecutionStatus(runId, "running");
+      while (true) {
+        let nextApproval = extractApprovalRequest(result);
+        while (nextApproval) {
+          const nextDecisions = await this.reviewApprovalActions(
+            nextApproval.actions,
+            runId,
+            session,
+          );
+          result = await agent.invoke(
+            new Command({ resume: { decisions: nextDecisions } }),
+            runConfig,
+          );
+          this.persistence.runs.setExecutionStatus(runId, "running");
+          await this.recordLatestCheckpoint(runId, session);
+          nextApproval = extractApprovalRequest(result);
+        }
+        if (steeringQueue.closeIfEmpty()) {
+          break;
+        }
+        const intermediateMessage = [...(result.messages ?? [])]
+          .reverse()
+          .find((message) => AIMessage.isInstance(message));
+        const intermediateText = intermediateMessage
+          ? messageText(intermediateMessage.content)
+          : "";
+        if (intermediateText) {
+          session.transcript.push({
+            role: "assistant",
+            content: intermediateText,
+          });
+          this.persistence.conversationEvents.append({
+            sessionId: session.id,
+            runId,
+            eventType: "assistant_message",
+            payload: { schemaVersion: 1, content: intermediateText },
+          });
+        }
+        await this.post({ type: "modelBoundary" });
+        result = await agent.invoke({ messages: [] }, runConfig);
         await this.recordLatestCheckpoint(runId, session);
-        nextApproval = extractApprovalRequest(result);
       }
 
       const messages = result.messages ?? [];
@@ -681,6 +1089,10 @@ class DeepAgentsChatPanel {
     } catch (error) {
       const cancelled = this.cancellation.signal.aborted;
       const message = cancelled ? "Cancelled." : formatError(error);
+      await this.discardSteeringQueue(
+        runId,
+        cancelled ? "cancelled" : "failed",
+      );
       if (attemptId) {
         session.transcript.push({ role: "assistant", content: message });
         this.persistence.conversationEvents.append({
@@ -706,6 +1118,84 @@ class DeepAgentsChatPanel {
       }
       this.running = false;
       this.cancellation = undefined;
+      this.clearSteeringQueue(runId);
+    }
+  }
+
+  private activateSteeringQueue(
+    runId: string,
+    sessionId: string,
+    restoredEntries: readonly SteeringEntry[] = [],
+  ): SteeringQueue {
+    const queue = new SteeringQueue(restoredEntries);
+    this.activeSteering = { runId, sessionId, queue };
+    return queue;
+  }
+
+  private recordSteeringInjection(
+    runId: string,
+    sessionId: string,
+    injection: SteeringInjection,
+  ): void {
+    for (const entry of injection.entries) {
+      this.persistence.conversationEvents.append({
+        sessionId,
+        runId,
+        eventType: "steering_injected",
+        payload: {
+          schemaVersion: 1,
+          steeringId: entry.id,
+          boundary: injection.boundary,
+        },
+      });
+      void this.post({
+        type: "steeringInjected",
+        requestId: entry.id,
+        boundary: injection.boundary,
+      });
+    }
+  }
+
+  private async discardSteeringQueue(
+    runId: string,
+    reason: "cancelled" | "failed",
+  ): Promise<void> {
+    const active = this.activeSteering;
+    if (!active || active.runId !== runId) {
+      return;
+    }
+    for (const entry of active.queue.discardPending()) {
+      this.persistence.conversationEvents.append({
+        sessionId: active.sessionId,
+        runId,
+        eventType: "steering_discarded",
+        payload: {
+          schemaVersion: 1,
+          steeringId: entry.id,
+          reason,
+        },
+      });
+      await this.post({
+        type: "steeringDiscarded",
+        requestId: entry.id,
+        reason,
+      });
+    }
+  }
+
+  private restorePendingSteering(
+    runId: string,
+    sessionId: string,
+  ): SteeringEntry[] {
+    return pendingSteeringEntriesFromEvents(
+      this.persistence.conversationEvents.list(sessionId),
+      runId,
+    );
+  }
+
+  private clearSteeringQueue(runId: string): void {
+    if (this.activeSteering?.runId === runId) {
+      this.activeSteering = undefined;
     }
   }
 
@@ -713,25 +1203,138 @@ class DeepAgentsChatPanel {
     adapter: VsCodeChatModel,
     session: ChatSession,
     runId: string,
+    agentDefinition: ProjectAgentDefinition,
+    steeringQueue: SteeringQueue,
   ) {
+    const delegation = resolveProjectAgentDelegation(
+      agentDefinition,
+      this.customizations,
+    );
+    const subagents: CompiledSubAgent[] = delegation.children.map((child) => ({
+      name: child.id,
+      description: child.description ?? child.name,
+      runnable: this.createProjectAgentRuntime(
+        adapter,
+        session,
+        runId,
+        child,
+        [],
+        false,
+        undefined,
+      ),
+    }));
+    return this.createProjectAgentRuntime(
+      adapter,
+      session,
+      runId,
+      agentDefinition,
+      subagents,
+      true,
+      steeringQueue,
+    );
+  }
+
+  private createProjectAgentRuntime(
+    adapter: VsCodeChatModel,
+    session: ChatSession,
+    runId: string,
+    agentDefinition: ProjectAgentDefinition,
+    subagents: CompiledSubAgent[],
+    persistCheckpoints: boolean,
+    steeringQueue: SteeringQueue | undefined,
+  ) {
+    const configuredPolicy = resolveAgentToolPolicy(agentDefinition.tools, {
+      mcpServerNames: Object.keys(this.customizations.mcp?.servers ?? {}),
+    });
+    const policy: AgentToolPolicy = {
+      ...configuredPolicy,
+      allows(toolName: string): boolean {
+        return (
+          configuredPolicy.allows(toolName) &&
+          (toolName !== "task" || subagents.length > 0)
+        );
+      },
+    };
+    const mcp = createAllowedVscodeMcpTools(
+      this.customizations.mcp,
+      policy,
+    );
+    const webBrowser = createAllowedVscodeWebBrowserTools(policy);
+    const modelNameAliases = new Map([
+      ...mcp.modelNameAliases,
+      ...webBrowser.modelNameAliases,
+    ]);
+    const browserApprovalInterrupts = Object.fromEntries(
+      webBrowser.approvalProviderNames.map((providerName) => [
+        providerName,
+        {
+          allowedDecisions: ["approve", "reject"],
+          description:
+            "Review this interactive browser action. It may submit data, confirm an external action, or change remote page state.",
+          when: ({ toolCall }: { toolCall: { name: string } }) =>
+            !session.allowedTools.has(toolCall.name),
+        },
+      ]),
+    );
     return createDeepAgent({
       model: adapter,
+      name: agentDefinition.id,
       tools: [
-        createExecuteCommandTool({
-          workspaceRoot: this.workspaceRoot,
-        }),
+        ...(policy.allows("execute_command")
+          ? [
+              createExecuteCommandTool({
+                workspaceRoot: this.workspaceRoot,
+              }),
+            ]
+          : []),
+        ...mcp.tools,
+        ...webBrowser.tools,
       ],
       backend: new FilesystemBackend({
         rootDir: this.workspaceRoot,
         virtualMode: true,
       }),
       middleware: [
+        createRepeatedToolFailureMiddleware(),
+        createSubAgentMiddleware({
+          defaultModel: adapter,
+          subagents,
+          generalPurposeAgent: false,
+          systemPrompt: PROJECT_AGENT_DELEGATION_SYSTEM_PROMPT,
+          taskDescription: PROJECT_AGENT_TASK_DESCRIPTION,
+        }),
+        createProjectAgentDelegationGuardMiddleware(
+          subagents.map((subagent) => subagent.name),
+        ),
+        ...(steeringQueue
+          ? [
+              createSteeringMiddleware(
+                steeringQueue,
+                (injection) =>
+                  this.recordSteeringInjection(
+                    runId,
+                    session.id,
+                    injection,
+                  ),
+              ),
+            ]
+          : []),
+        createAgentToolPolicyMiddleware(
+          policy,
+          modelNameAliases,
+        ),
+        createProjectSkillsMiddleware(
+          this.customizations.skills,
+          this.workspaceRoot,
+        ),
         createToolExecutionLedgerMiddleware({
           repository: this.persistence.toolExecutions,
           runId,
         }),
       ],
-      checkpointer: this.persistence.checkpointer,
+      ...(persistCheckpoints
+        ? { checkpointer: this.persistence.checkpointer }
+        : {}),
       interruptOn: {
         write_file: {
           allowedDecisions: ["approve", "reject"],
@@ -749,9 +1352,44 @@ class DeepAgentsChatPanel {
             "Review this command carefully. It runs directly on the host in the current workspace.",
           when: ({ toolCall }) => !session.allowedTools.has(toolCall.name),
         },
+        ...browserApprovalInterrupts,
       },
-      systemPrompt: AGENT_SYSTEM_PROMPT,
+      systemPrompt: configureDeepAgentSystemPrompt(
+        agentDefinition.body,
+        INCLUDE_DEEPAGENTS_DEFAULT_SYSTEM_PROMPT,
+      ),
     });
+  }
+
+  private logModelPrompt(
+    snapshot: ModelPromptSnapshot,
+    runId: string,
+    session: ChatSession,
+    agentId: string,
+    model: vscode.LanguageModelChat,
+  ): void {
+    this.modelCallsOutput.appendLine(
+      `[${new Date().toISOString()}] run=${runId} session=${session.id} agent=${agentId} model=${modelKey(model)}`,
+    );
+    this.modelCallsOutput.appendLine("===== SYSTEM PROMPT =====");
+    this.modelCallsOutput.appendLine(snapshot.systemPrompt);
+    this.modelCallsOutput.appendLine("===== USER PROMPT =====");
+    this.modelCallsOutput.appendLine(snapshot.userPrompt);
+    this.modelCallsOutput.appendLine("===== END MODEL CALL =====");
+    this.modelCallsOutput.appendLine("");
+    this.modelCallsOutput.show(true);
+  }
+
+  private async resolveSelectedAgentForRun(): Promise<
+    ProjectAgentDefinition | undefined
+  > {
+    this.customizations = await discoverProjectCustomizations(
+      this.workspaceRoot,
+    );
+    this.agentRegistry = new ProjectAgentRegistry(this.customizations);
+    await this.postWorkbenchState(false);
+    const agent = this.agentRegistry.get(this.activeSession.selectedAgentId);
+    return agent?.userInvocable ? agent : undefined;
   }
 
   private async reviewApprovalActions(
@@ -1053,6 +1691,13 @@ class DeepAgentsChatPanel {
       replaceMessages,
       currentSessionId: active.id,
       selectedModelKey: this.selectedModelKey,
+      selectedAgentId: active.selectedAgentId,
+      agents: this.agentRegistry.listUserInvocable().map((agent) => ({
+        id: agent.id,
+        name: agent.name,
+        description: agent.description,
+        argumentHint: agent.argumentHint,
+      })),
       models: this.models.map((model) => ({
         key: modelKey(model),
         name: model.name,
@@ -1159,9 +1804,11 @@ class DeepAgentsChatPanel {
 type WebviewMessage =
   | { type: "ready" }
   | { type: "send"; text: string }
+  | { type: "steer"; requestId: string; text: string }
   | { type: "cancel" }
   | { type: "clear" }
   | { type: "selectModel"; modelKey: string }
+  | { type: "selectAgent"; agentId: string }
   | { type: "newSession" }
   | { type: "selectSession"; sessionId: string }
   | { type: "renameSession"; sessionId: string; title: string }
@@ -1214,6 +1861,9 @@ function isWebviewMessage(value: unknown): value is WebviewMessage {
   if (type === "selectModel") {
     return typeof (value as { modelKey?: unknown }).modelKey === "string";
   }
+  if (type === "selectAgent") {
+    return typeof (value as { agentId?: unknown }).agentId === "string";
+  }
   if (type === "selectSession" || type === "deleteSession") {
     return typeof (value as { sessionId?: unknown }).sessionId === "string";
   }
@@ -1244,6 +1894,13 @@ function isWebviewMessage(value: unknown): value is WebviewMessage {
   }
   if (type === "resumePendingApproval") {
     return typeof (value as { runId?: unknown }).runId === "string";
+  }
+  if (type === "steer") {
+    const message = value as { requestId?: unknown; text?: unknown };
+    return (
+      typeof message.requestId === "string" &&
+      typeof message.text === "string"
+    );
   }
   return type === "send" && typeof (value as { text?: unknown }).text === "string";
 }
@@ -1468,6 +2125,7 @@ function createSession(
     threadId: stored.threadId,
     title: stored.title,
     selectedModelKey,
+    selectedAgentId: null,
     transcript: [],
     allowedTools: allowedToolsForSession(processInstanceId, stored.id),
   };
@@ -1483,6 +2141,7 @@ function loadSessions(
     threadId: session.threadId,
     title: session.title,
     selectedModelKey: session.selectedModelKey ?? fallbackModelKey,
+    selectedAgentId: session.selectedAgentId,
     transcript: persistence.conversationEvents
       .list(session.id)
       .filter(
@@ -1737,6 +2396,23 @@ function renderWebview(
       background: var(--vscode-editorWidget-background);
       border: 1px solid var(--vscode-widget-border);
     }
+    .message.steering {
+      border: 1px dashed var(--vscode-focusBorder);
+    }
+    .message.steering::before {
+      content: "Steering";
+      display: block;
+      margin-bottom: 4px;
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      opacity: .75;
+    }
+    .message.steering.discarded {
+      opacity: .65;
+      text-decoration: line-through;
+    }
     .activity {
       align-self: stretch;
       border-left: 2px solid var(--vscode-progressBar-background);
@@ -1821,8 +2497,23 @@ function renderWebview(
       gap: 8px;
       margin-top: 8px;
     }
-    .send-actions { display: flex; gap: 8px; }
-    #model-select {
+    .primary-actions { display: flex; gap: 8px; }
+    #primary-action {
+      width: 34px;
+      height: 30px;
+      padding: 0;
+      display: inline-grid;
+      place-items: center;
+      border-radius: 4px;
+      font-size: 18px;
+      line-height: 1;
+    }
+    .selectors {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    #model-select, #agent-select {
       max-width: min(340px, 50vw);
       min-width: 150px;
       padding: 5px 24px 5px 7px;
@@ -1831,7 +2522,6 @@ function renderWebview(
       border: 1px solid var(--vscode-dropdown-border);
       font: inherit;
     }
-    #cancel { display: none; }
     @media (max-width: 720px) {
       .workbench { grid-template-columns: 180px minmax(0, 1fr); }
     }
@@ -1861,10 +2551,14 @@ function renderWebview(
       <form id="form">
         <textarea id="prompt" aria-label="Message" placeholder="Ask the agent to inspect, build, test, or edit this workspace."></textarea>
         <div class="actions">
-          <select id="model-select" aria-label="Language model"></select>
-          <div class="send-actions">
-            <button id="cancel" class="secondary" type="button">Cancel</button>
-            <button id="send" type="submit">Send</button>
+          <div class="selectors">
+            <select id="agent-select" aria-label="Project agent"></select>
+            <select id="model-select" aria-label="Language model"></select>
+          </div>
+          <div class="primary-actions">
+            <button id="primary-action" type="submit" title="Send message" aria-label="Send message">
+              <span aria-hidden="true">→</span>
+            </button>
           </div>
         </div>
       </form>
@@ -1875,16 +2569,33 @@ function renderWebview(
     const messages = document.getElementById("messages");
     const form = document.getElementById("form");
     const prompt = document.getElementById("prompt");
-    const send = document.getElementById("send");
-    const cancel = document.getElementById("cancel");
+    const primaryAction = document.getElementById("primary-action");
     const clear = document.getElementById("clear");
     const newChat = document.getElementById("new-chat");
     const sessionList = document.getElementById("session-list");
+    const agentSelect = document.getElementById("agent-select");
     const modelSelect = document.getElementById("model-select");
     const subtitle = document.getElementById("subtitle");
     let draft = null;
     let running = false;
     let currentSessionId = "";
+    const pendingSteering = new Map();
+    const resolveComposerControlState =
+      ${resolveComposerControlState.toString()};
+
+    function updateComposerControl() {
+      const state = resolveComposerControlState(
+        running,
+        prompt.value,
+        Boolean(agentSelect.value),
+      );
+      primaryAction.dataset.action = state.action;
+      primaryAction.disabled = state.disabled;
+      primaryAction.title = state.label;
+      primaryAction.setAttribute("aria-label", state.label);
+      primaryAction.querySelector("span").textContent = state.icon;
+      return state;
+    }
 
     function addMessage(role, text) {
       document.getElementById("empty")?.remove();
@@ -1893,6 +2604,26 @@ function renderWebview(
       element.textContent = text;
       messages.appendChild(element);
       messages.scrollTop = messages.scrollHeight;
+      return element;
+    }
+
+    function addSteeringMessage(requestId, text, status = "queued") {
+      let element = document.querySelector(
+        '[data-steering-id="' + CSS.escape(requestId) + '"]'
+      );
+      if (!element) {
+        element = addMessage("user steering", text);
+        element.dataset.steeringId = requestId;
+      } else if (text) {
+        element.textContent = text;
+      }
+      element.classList.toggle("discarded", status === "discarded");
+      element.dataset.steeringStatus = status;
+      element.title = status === "injected"
+        ? "Steering applied at a safe model boundary"
+        : status === "discarded"
+          ? "Steering was not applied"
+          : "Steering queued for the next safe model boundary";
       return element;
     }
 
@@ -2026,6 +2757,8 @@ function renderWebview(
       for (const item of replayItems) {
         if (item.kind === "message") {
           addMessage(item.role, item.content);
+        } else if (item.kind === "steering_message") {
+          addSteeringMessage(item.steeringId, item.content, item.status);
         } else if (item.kind === "tool_call") {
           addActivity(
             item.toolCallId,
@@ -2222,35 +2955,72 @@ function renderWebview(
         : "${escapedRoot}";
     }
 
+    function renderAgents(agents, selectedAgentId) {
+      const existing = Array.from(agentSelect.options).map(
+        (option) => option.value,
+      );
+      const incoming = ["", ...agents.map((agent) => agent.id)];
+      if (existing.join("\\n") !== incoming.join("\\n")) {
+        agentSelect.replaceChildren();
+        const placeholder = document.createElement("option");
+        placeholder.value = "";
+        placeholder.textContent = "Select an agent";
+        agentSelect.appendChild(placeholder);
+        for (const agent of agents) {
+          const option = document.createElement("option");
+          option.value = agent.id;
+          option.textContent = agent.name;
+          option.title = agent.description || agent.argumentHint || agent.name;
+          agentSelect.appendChild(option);
+        }
+      }
+      agentSelect.value = agents.some((agent) => agent.id === selectedAgentId)
+        ? selectedAgentId
+        : "";
+      updateComposerControl();
+    }
+
     function setRunning(value) {
       running = value;
-      send.disabled = value;
+      updateComposerControl();
       clear.disabled = value;
       newChat.disabled = value;
+      agentSelect.disabled = value;
       modelSelect.disabled = value;
-      cancel.style.display = value ? "block" : "none";
-      prompt.disabled = value;
       for (const button of sessionList.querySelectorAll("button")) {
         button.disabled = value;
       }
       if (!value) prompt.focus();
     }
 
+    function activatePrimaryControl() {
+      const state = updateComposerControl();
+      if (state.disabled) return;
+      const text = prompt.value.trim();
+      if (state.action === "stop") {
+        vscode.postMessage({ type: "cancel" });
+      } else if (state.action === "send") {
+        addMessage("user", text);
+        prompt.value = "";
+        updateComposerControl();
+        vscode.postMessage({ type: "send", text });
+      } else {
+        const requestId = crypto.randomUUID();
+        pendingSteering.set(requestId, text);
+        vscode.postMessage({ type: "steer", requestId, text });
+      }
+    }
     form.addEventListener("submit", (event) => {
       event.preventDefault();
-      const text = prompt.value.trim();
-      if (!text || running) return;
-      addMessage("user", text);
-      prompt.value = "";
-      vscode.postMessage({ type: "send", text });
+      activatePrimaryControl();
     });
     prompt.addEventListener("keydown", (event) => {
       if (event.key === "Enter" && !event.shiftKey) {
         event.preventDefault();
-        form.requestSubmit();
+        activatePrimaryControl();
       }
     });
-    cancel.addEventListener("click", () => vscode.postMessage({ type: "cancel" }));
+    prompt.addEventListener("input", updateComposerControl);
     clear.addEventListener("click", () => vscode.postMessage({ type: "clear" }));
     newChat.addEventListener("click", () => {
       if (!running) vscode.postMessage({ type: "newSession" });
@@ -2260,12 +3030,22 @@ function renderWebview(
         vscode.postMessage({ type: "selectModel", modelKey: modelSelect.value });
       }
     });
+    agentSelect.addEventListener("change", () => {
+      updateComposerControl();
+      if (!running) {
+        vscode.postMessage({
+          type: "selectAgent",
+          agentId: agentSelect.value,
+        });
+      }
+    });
 
     window.addEventListener("message", ({ data }) => {
       switch (data.type) {
         case "workbenchState":
           currentSessionId = data.currentSessionId;
           renderSessions(data.sessions);
+          renderAgents(data.agents, data.selectedAgentId);
           renderModels(data.models, data.selectedModelKey);
           if (data.replaceMessages) {
             replaceConversation(data.replayItems);
@@ -2287,6 +3067,10 @@ function renderWebview(
           break;
         case "toolResult":
           addActivity(data.id, data.label, data.text);
+          // A tool result closes the current model/tool segment. The next text
+          // belongs to a fresh model response (including parent text after a
+          // delegated child's final response), so it needs a new bubble.
+          draft = null;
           break;
         case "approvalRequested":
           addApproval(data.requestId, data.actions, data.allowSession);
@@ -2294,6 +3078,30 @@ function renderWebview(
           break;
         case "approvalResolved":
           resolveApproval(data.requestId, data.decision);
+          break;
+        case "steeringAccepted": {
+          const submitted = pendingSteering.get(data.requestId);
+          pendingSteering.delete(data.requestId);
+          addSteeringMessage(data.requestId, data.text, "queued");
+          if (submitted && prompt.value.trim() === submitted) {
+            prompt.value = "";
+            updateComposerControl();
+          }
+          break;
+        }
+        case "steeringInjected":
+          addSteeringMessage(data.requestId, "", "injected");
+          break;
+        case "steeringDiscarded":
+          addSteeringMessage(data.requestId, "", "discarded");
+          break;
+        case "steeringRejected":
+          pendingSteering.delete(data.requestId);
+          primaryAction.title = data.reason;
+          primaryAction.setAttribute("aria-label", data.reason);
+          break;
+        case "modelBoundary":
+          draft = null;
           break;
         case "runCompleted":
           if (!draft || draft.textContent !== data.text) addMessage("assistant", data.text);
