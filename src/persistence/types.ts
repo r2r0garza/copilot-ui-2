@@ -19,6 +19,7 @@ export interface ChatSession {
   title: string;
   titleSource: TitleSource;
   selectedModelKey: string | null;
+  selectedAgentId: string | null;
   status: SessionStatus;
   createdAt: string;
   updatedAt: string;

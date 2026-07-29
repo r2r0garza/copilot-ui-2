@@ -254,6 +254,14 @@ export const APP_MIGRATIONS: readonly Migration[] = [
         ON recovery_reconciliations(run_id, created_at);
     `,
   },
+  {
+    version: 3,
+    name: "session_agent_selection",
+    sql: `
+      ALTER TABLE chat_sessions
+        ADD COLUMN selected_agent_id TEXT;
+    `,
+  },
 ];
 
 export function applyMigrations(

@@ -8,7 +8,11 @@ import {
   validateExecuteCommandInput,
 } from "./executeCommandTool";
 import { WorkbenchSidebarProvider } from "./sidebarProvider";
-import { VsCodeChatModel, type AdapterEvent } from "./vscodeChatModel";
+import {
+  VsCodeChatModel,
+  type AdapterEvent,
+  type ModelPromptSnapshot,
+} from "./vscodeChatModel";
 import { PersistenceService } from "./persistence/PersistenceService";
 import {
   projectConversationEvents,
@@ -23,32 +27,32 @@ import {
 } from "./toolExecutionLedger";
 import {
   discoverProjectCustomizations,
+  type ProjectAgentDefinition,
   type ProjectCustomizations,
 } from "./projectCustomizations";
-import { resolveAgentToolPolicy } from "./agentToolPolicy";
+import {
+  createAgentToolPolicyMiddleware,
+  resolveAgentToolPolicy,
+  type AgentToolPolicy,
+} from "./agentToolPolicy";
+import { ProjectAgentRegistry } from "./projectAgentRegistry";
+import { configureDeepAgentSystemPrompt } from "./deepAgentSystemPrompt";
+import { createProjectSkillsMiddleware } from "./projectSkillsMiddleware";
 
 let currentPanel: DeepAgentsChatPanel | undefined;
 const processAllowedTools = new Map<string, Set<string>>();
 const RUN_LEASE_MS = 30_000;
 const RUN_HEARTBEAT_MS = 10_000;
-const AGENT_SYSTEM_PROMPT = [
-  "You are a coding agent running inside VS Code.",
-  "The virtual filesystem root / is the current VS Code workspace.",
-  "Use your filesystem, planning, and execute_command tools when they help answer the user.",
-  "Inspect before editing, keep changes scoped, and clearly summarize any files changed.",
-  "File writes and edits require user approval unless allowed for this chat session.",
-  "execute_command requires user approval unless allowed for this chat session. Pass an executable and argument array; shell syntax is not interpreted.",
-  "When a tool requires approval, call it immediately. Never ask for permission in conversational text; the host application owns the approval interaction.",
-  "Never use '..', '~', home-directory variables, or absolute paths outside the workspace in command arguments; they are rejected.",
-  "For commands targeting the workspace root, omit the path argument or use '.' exactly. After a path guard rejection, do not try alternate forms such as /, /root, ~, or environment variables. Retry at most once with '.' or no path; if that cannot satisfy the request, explain the restriction and stop.",
-  "When the user requests command output, include the relevant stdout or stderr in your final response instead of only saying the command ran.",
-].join("\n");
+const INCLUDE_DEEPAGENTS_DEFAULT_SYSTEM_PROMPT = false;
 
 export function activate(context: vscode.ExtensionContext): void {
   let persistence: PersistenceService | undefined;
   const processInstanceId = crypto.randomUUID();
   const customizationsOutput = vscode.window.createOutputChannel(
     "Deep Agents Customizations",
+  );
+  const modelCallsOutput = vscode.window.createOutputChannel(
+    "Deep Agents Model Calls",
   );
   const openWorkbench = async (): Promise<void> => {
     if (currentPanel) {
@@ -89,15 +93,27 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }
 
-    currentPanel = new DeepAgentsChatPanel(
-      context,
-      models,
-      persistence,
-      processInstanceId,
-      () => {
-        currentPanel = undefined;
-      },
-    );
+    try {
+      const customizations = await discoverProjectCustomizations(
+        workspaceUri.fsPath,
+      );
+      currentPanel = new DeepAgentsChatPanel(
+        context,
+        models,
+        persistence,
+        processInstanceId,
+        workspaceUri.fsPath,
+        customizations,
+        modelCallsOutput,
+        () => {
+          currentPanel = undefined;
+        },
+      );
+    } catch (error) {
+      void vscode.window.showErrorMessage(
+        `Unable to load project agents: ${formatError(error)}`,
+      );
+    }
   };
 
   context.subscriptions.push(
@@ -132,6 +148,7 @@ export function activate(context: vscode.ExtensionContext): void {
       { webviewOptions: { retainContextWhenHidden: true } },
     ),
     customizationsOutput,
+    modelCallsOutput,
   );
 }
 
@@ -217,6 +234,7 @@ interface ChatSession {
   threadId: string;
   title: string;
   selectedModelKey: string;
+  selectedAgentId: string | null;
   transcript: Array<{ role: "user" | "assistant"; content: string }>;
   allowedTools: Set<string>;
 }
@@ -228,6 +246,9 @@ class DeepAgentsChatPanel {
   private readonly models: vscode.LanguageModelChat[];
   private readonly persistence: PersistenceService;
   private readonly processInstanceId: string;
+  private readonly modelCallsOutput: vscode.OutputChannel;
+  private customizations: ProjectCustomizations;
+  private agentRegistry: ProjectAgentRegistry;
   private readonly sessions: ChatSession[] = [];
   private readonly toolCalls = new Map<
     string,
@@ -249,11 +270,18 @@ class DeepAgentsChatPanel {
     models: vscode.LanguageModelChat[],
     persistence: PersistenceService,
     processInstanceId: string,
+    workspaceRoot: string,
+    customizations: ProjectCustomizations,
+    modelCallsOutput: vscode.OutputChannel,
     onDispose: () => void,
   ) {
     this.models = models;
     this.persistence = persistence;
     this.processInstanceId = processInstanceId;
+    this.workspaceRoot = workspaceRoot;
+    this.customizations = customizations;
+    this.agentRegistry = new ProjectAgentRegistry(customizations);
+    this.modelCallsOutput = modelCallsOutput;
     this.sessions.push(
       ...loadSessions(persistence, modelKey(models[0]), processInstanceId),
     );
@@ -264,8 +292,6 @@ class DeepAgentsChatPanel {
     }
     const initialSession = this.sessions[0];
     this.currentSessionId = initialSession.id;
-    this.workspaceRoot =
-      vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
     this.panel = vscode.window.createWebviewPanel(
       "deepagentsSpike.chat",
       "Deep Agents Spike",
@@ -440,6 +466,20 @@ class DeepAgentsChatPanel {
       }
       return;
     }
+    if (raw.type === "selectAgent" && !this.running) {
+      const agentId = raw.agentId || null;
+      if (
+        agentId === null ||
+        this.agentRegistry
+          .listUserInvocable()
+          .some((agent) => agent.id === agentId)
+      ) {
+        this.activeSession.selectedAgentId = agentId;
+        this.persistence.sessions.setAgent(this.activeSession.id, agentId);
+        await this.postWorkbenchState(false);
+      }
+      return;
+    }
     if (raw.type === "newSession" && !this.running) {
       const session = createSession(
         this.persistence,
@@ -510,6 +550,14 @@ class DeepAgentsChatPanel {
   }
 
   private async run(prompt: string): Promise<void> {
+    const selectedAgent = await this.resolveSelectedAgentForRun();
+    if (!selectedAgent) {
+      await this.post({
+        type: "runFailed",
+        message: "Select an agent before sending a message.",
+      });
+      return;
+    }
     this.running = true;
     this.cancellation = new AbortController();
     this.toolCalls.clear();
@@ -550,6 +598,14 @@ class DeepAgentsChatPanel {
     let streamedFinalText = "";
     const adapter = new VsCodeChatModel({
       model,
+      onPrompt: (snapshot) =>
+        this.logModelPrompt(
+          snapshot,
+          runId,
+          session,
+          selectedAgent.id,
+          model,
+        ),
       onEvent: (event) => {
         if (event.kind === "text") {
           streamedFinalText += event.text;
@@ -558,7 +614,7 @@ class DeepAgentsChatPanel {
       },
     });
 
-    const agent = this.createAgent(adapter, session, runId);
+    const agent = this.createAgent(adapter, session, runId, selectedAgent);
 
     try {
       const runConfig = {
@@ -637,6 +693,14 @@ class DeepAgentsChatPanel {
     if (!recovery || recovery.recoveryClass !== "waiting_for_approval") {
       return;
     }
+    const selectedAgent = await this.resolveSelectedAgentForRun();
+    if (!selectedAgent) {
+      await this.post({
+        type: "runFailed",
+        message: "Select the original agent before resuming this run.",
+      });
+      return;
+    }
 
     this.running = true;
     this.cancellation = new AbortController();
@@ -692,6 +756,14 @@ class DeepAgentsChatPanel {
       let streamedFinalText = "";
       const adapter = new VsCodeChatModel({
         model,
+        onPrompt: (snapshot) =>
+          this.logModelPrompt(
+            snapshot,
+            runId,
+            session,
+            selectedAgent.id,
+            model,
+          ),
         onEvent: (event) => {
           if (event.kind === "text") {
             streamedFinalText += event.text;
@@ -699,7 +771,7 @@ class DeepAgentsChatPanel {
           void this.postAdapterEvent(event, runId, session.id);
         },
       });
-      const agent = this.createAgent(adapter, session, runId);
+      const agent = this.createAgent(adapter, session, runId, selectedAgent);
       const runConfig = {
         configurable: {
           thread_id: resumed.run.threadId,
@@ -800,19 +872,37 @@ class DeepAgentsChatPanel {
     adapter: VsCodeChatModel,
     session: ChatSession,
     runId: string,
+    agentDefinition: ProjectAgentDefinition,
   ) {
+    const configuredPolicy = resolveAgentToolPolicy(agentDefinition.tools, {
+      mcpServerNames: Object.keys(this.customizations.mcp?.servers ?? {}),
+    });
+    const policy: AgentToolPolicy = {
+      ...configuredPolicy,
+      allows(toolName: string): boolean {
+        return toolName !== "task" && configuredPolicy.allows(toolName);
+      },
+    };
     return createDeepAgent({
       model: adapter,
-      tools: [
-        createExecuteCommandTool({
-          workspaceRoot: this.workspaceRoot,
-        }),
-      ],
+      name: agentDefinition.id,
+      tools: policy.allows("execute_command")
+        ? [
+            createExecuteCommandTool({
+              workspaceRoot: this.workspaceRoot,
+            }),
+          ]
+        : [],
       backend: new FilesystemBackend({
         rootDir: this.workspaceRoot,
         virtualMode: true,
       }),
       middleware: [
+        createAgentToolPolicyMiddleware(policy),
+        createProjectSkillsMiddleware(
+          this.customizations.skills,
+          this.workspaceRoot,
+        ),
         createToolExecutionLedgerMiddleware({
           repository: this.persistence.toolExecutions,
           runId,
@@ -837,8 +927,42 @@ class DeepAgentsChatPanel {
           when: ({ toolCall }) => !session.allowedTools.has(toolCall.name),
         },
       },
-      systemPrompt: AGENT_SYSTEM_PROMPT,
+      systemPrompt: configureDeepAgentSystemPrompt(
+        agentDefinition.body,
+        INCLUDE_DEEPAGENTS_DEFAULT_SYSTEM_PROMPT,
+      ),
     });
+  }
+
+  private logModelPrompt(
+    snapshot: ModelPromptSnapshot,
+    runId: string,
+    session: ChatSession,
+    agentId: string,
+    model: vscode.LanguageModelChat,
+  ): void {
+    this.modelCallsOutput.appendLine(
+      `[${new Date().toISOString()}] run=${runId} session=${session.id} agent=${agentId} model=${modelKey(model)}`,
+    );
+    this.modelCallsOutput.appendLine("===== SYSTEM PROMPT =====");
+    this.modelCallsOutput.appendLine(snapshot.systemPrompt);
+    this.modelCallsOutput.appendLine("===== USER PROMPT =====");
+    this.modelCallsOutput.appendLine(snapshot.userPrompt);
+    this.modelCallsOutput.appendLine("===== END MODEL CALL =====");
+    this.modelCallsOutput.appendLine("");
+    this.modelCallsOutput.show(true);
+  }
+
+  private async resolveSelectedAgentForRun(): Promise<
+    ProjectAgentDefinition | undefined
+  > {
+    this.customizations = await discoverProjectCustomizations(
+      this.workspaceRoot,
+    );
+    this.agentRegistry = new ProjectAgentRegistry(this.customizations);
+    await this.postWorkbenchState(false);
+    const agent = this.agentRegistry.get(this.activeSession.selectedAgentId);
+    return agent?.userInvocable ? agent : undefined;
   }
 
   private async reviewApprovalActions(
@@ -1140,6 +1264,13 @@ class DeepAgentsChatPanel {
       replaceMessages,
       currentSessionId: active.id,
       selectedModelKey: this.selectedModelKey,
+      selectedAgentId: active.selectedAgentId,
+      agents: this.agentRegistry.listUserInvocable().map((agent) => ({
+        id: agent.id,
+        name: agent.name,
+        description: agent.description,
+        argumentHint: agent.argumentHint,
+      })),
       models: this.models.map((model) => ({
         key: modelKey(model),
         name: model.name,
@@ -1249,6 +1380,7 @@ type WebviewMessage =
   | { type: "cancel" }
   | { type: "clear" }
   | { type: "selectModel"; modelKey: string }
+  | { type: "selectAgent"; agentId: string }
   | { type: "newSession" }
   | { type: "selectSession"; sessionId: string }
   | { type: "renameSession"; sessionId: string; title: string }
@@ -1300,6 +1432,9 @@ function isWebviewMessage(value: unknown): value is WebviewMessage {
   }
   if (type === "selectModel") {
     return typeof (value as { modelKey?: unknown }).modelKey === "string";
+  }
+  if (type === "selectAgent") {
+    return typeof (value as { agentId?: unknown }).agentId === "string";
   }
   if (type === "selectSession" || type === "deleteSession") {
     return typeof (value as { sessionId?: unknown }).sessionId === "string";
@@ -1555,6 +1690,7 @@ function createSession(
     threadId: stored.threadId,
     title: stored.title,
     selectedModelKey,
+    selectedAgentId: null,
     transcript: [],
     allowedTools: allowedToolsForSession(processInstanceId, stored.id),
   };
@@ -1570,6 +1706,7 @@ function loadSessions(
     threadId: session.threadId,
     title: session.title,
     selectedModelKey: session.selectedModelKey ?? fallbackModelKey,
+    selectedAgentId: session.selectedAgentId,
     transcript: persistence.conversationEvents
       .list(session.id)
       .filter(
@@ -1909,7 +2046,12 @@ function renderWebview(
       margin-top: 8px;
     }
     .send-actions { display: flex; gap: 8px; }
-    #model-select {
+    .selectors {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    #model-select, #agent-select {
       max-width: min(340px, 50vw);
       min-width: 150px;
       padding: 5px 24px 5px 7px;
@@ -1948,7 +2090,10 @@ function renderWebview(
       <form id="form">
         <textarea id="prompt" aria-label="Message" placeholder="Ask the agent to inspect, build, test, or edit this workspace."></textarea>
         <div class="actions">
-          <select id="model-select" aria-label="Language model"></select>
+          <div class="selectors">
+            <select id="agent-select" aria-label="Project agent"></select>
+            <select id="model-select" aria-label="Language model"></select>
+          </div>
           <div class="send-actions">
             <button id="cancel" class="secondary" type="button">Cancel</button>
             <button id="send" type="submit">Send</button>
@@ -1967,11 +2112,16 @@ function renderWebview(
     const clear = document.getElementById("clear");
     const newChat = document.getElementById("new-chat");
     const sessionList = document.getElementById("session-list");
+    const agentSelect = document.getElementById("agent-select");
     const modelSelect = document.getElementById("model-select");
     const subtitle = document.getElementById("subtitle");
     let draft = null;
     let running = false;
     let currentSessionId = "";
+
+    function updateSendAvailability() {
+      send.disabled = running || !agentSelect.value;
+    }
 
     function addMessage(role, text) {
       document.getElementById("empty")?.remove();
@@ -2309,11 +2459,37 @@ function renderWebview(
         : "${escapedRoot}";
     }
 
+    function renderAgents(agents, selectedAgentId) {
+      const existing = Array.from(agentSelect.options).map(
+        (option) => option.value,
+      );
+      const incoming = ["", ...agents.map((agent) => agent.id)];
+      if (existing.join("\\n") !== incoming.join("\\n")) {
+        agentSelect.replaceChildren();
+        const placeholder = document.createElement("option");
+        placeholder.value = "";
+        placeholder.textContent = "Select an agent";
+        agentSelect.appendChild(placeholder);
+        for (const agent of agents) {
+          const option = document.createElement("option");
+          option.value = agent.id;
+          option.textContent = agent.name;
+          option.title = agent.description || agent.argumentHint || agent.name;
+          agentSelect.appendChild(option);
+        }
+      }
+      agentSelect.value = agents.some((agent) => agent.id === selectedAgentId)
+        ? selectedAgentId
+        : "";
+      updateSendAvailability();
+    }
+
     function setRunning(value) {
       running = value;
-      send.disabled = value;
+      updateSendAvailability();
       clear.disabled = value;
       newChat.disabled = value;
+      agentSelect.disabled = value;
       modelSelect.disabled = value;
       cancel.style.display = value ? "block" : "none";
       prompt.disabled = value;
@@ -2347,12 +2523,22 @@ function renderWebview(
         vscode.postMessage({ type: "selectModel", modelKey: modelSelect.value });
       }
     });
+    agentSelect.addEventListener("change", () => {
+      updateSendAvailability();
+      if (!running) {
+        vscode.postMessage({
+          type: "selectAgent",
+          agentId: agentSelect.value,
+        });
+      }
+    });
 
     window.addEventListener("message", ({ data }) => {
       switch (data.type) {
         case "workbenchState":
           currentSessionId = data.currentSessionId;
           renderSessions(data.sessions);
+          renderAgents(data.agents, data.selectedAgentId);
           renderModels(data.models, data.selectedModelKey);
           if (data.replaceMessages) {
             replaceConversation(data.replayItems);

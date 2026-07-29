@@ -20,6 +20,7 @@ async function main(): Promise<void> {
       id: "session-1",
       threadId: "thread-1",
       selectedModelKey: "copilot/model-a",
+      selectedAgentId: "writer",
     });
     service.sessions.create({ id: "session-2", threadId: "thread-2" });
     service.sessions.rename(first.id, "Manual title");
@@ -28,6 +29,9 @@ async function main(): Promise<void> {
       false,
     );
     assert.equal(service.sessions.get(first.id)?.title, "Manual title");
+    assert.equal(service.sessions.get(first.id)?.selectedAgentId, "writer");
+    service.sessions.setAgent(first.id, "coder");
+    assert.equal(service.sessions.get(first.id)?.selectedAgentId, "coder");
 
     service.conversationEvents.append({
       sessionId: first.id,
@@ -109,6 +113,7 @@ async function main(): Promise<void> {
       service.sessions.get(first.id)?.selectedModelKey,
       "copilot/model-a",
     );
+    assert.equal(service.sessions.get(first.id)?.selectedAgentId, "coder");
     assert.equal(service.approvals.countForSession(first.id), 1);
     assert.equal(service.checkpointCleanup.list()[0].threadId, "thread-1");
 

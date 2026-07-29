@@ -17,6 +17,11 @@ export type AdapterEvent =
   | { kind: "toolCall"; id: string; name: string; input: object }
   | { kind: "toolResult"; id: string; text: string };
 
+export interface ModelPromptSnapshot {
+  systemPrompt: string;
+  userPrompt: string;
+}
+
 interface VsCodeChatModelCallOptions extends BaseChatModelCallOptions {
   tools?: ToolDefinition[];
 }
@@ -24,6 +29,7 @@ interface VsCodeChatModelCallOptions extends BaseChatModelCallOptions {
 interface VsCodeChatModelFields {
   model: vscode.LanguageModelChat;
   onEvent?: (event: AdapterEvent) => void;
+  onPrompt?: (snapshot: ModelPromptSnapshot) => void;
   seenToolResults?: Set<string>;
   boundTools?: ToolDefinition[];
 }
@@ -43,6 +49,7 @@ interface ProviderResult {
 export class VsCodeChatModel extends BaseChatModel<VsCodeChatModelCallOptions> {
   private readonly vscodeModel: vscode.LanguageModelChat;
   private readonly onEvent?: (event: AdapterEvent) => void;
+  private readonly onPrompt?: (snapshot: ModelPromptSnapshot) => void;
   private readonly seenToolResults: Set<string>;
   private readonly boundTools: ToolDefinition[];
 
@@ -50,6 +57,7 @@ export class VsCodeChatModel extends BaseChatModel<VsCodeChatModelCallOptions> {
     super({});
     this.vscodeModel = fields.model;
     this.onEvent = fields.onEvent;
+    this.onPrompt = fields.onPrompt;
     this.seenToolResults = fields.seenToolResults ?? new Set();
     this.boundTools = fields.boundTools ?? [];
   }
@@ -73,6 +81,7 @@ export class VsCodeChatModel extends BaseChatModel<VsCodeChatModelCallOptions> {
     return new VsCodeChatModel({
       model: this.vscodeModel,
       onEvent: this.onEvent,
+      onPrompt: this.onPrompt,
       seenToolResults: this.seenToolResults,
       boundTools: converted,
     });
@@ -114,6 +123,7 @@ export class VsCodeChatModel extends BaseChatModel<VsCodeChatModelCallOptions> {
     options: this["ParsedCallOptions"],
     runManager?: CallbackManagerForLLMRun,
   ): AsyncGenerator<ChatGenerationChunk> {
+    this.onPrompt?.(extractModelPromptSnapshot(messages));
     const vscodeMessages = this.toVsCodeMessages(messages);
     const tools = this.toVsCodeTools(options.tools ?? this.boundTools);
     const cancellation = this.createCancellation(options.signal);
@@ -175,6 +185,7 @@ export class VsCodeChatModel extends BaseChatModel<VsCodeChatModelCallOptions> {
     options: this["ParsedCallOptions"],
     onText?: (text: string) => Promise<void>,
   ): Promise<ProviderResult> {
+    this.onPrompt?.(extractModelPromptSnapshot(messages));
     const vscodeMessages = this.toVsCodeMessages(messages);
     const tools = this.toVsCodeTools(options.tools ?? this.boundTools);
     const cancellation = this.createCancellation(options.signal);
@@ -218,7 +229,30 @@ export class VsCodeChatModel extends BaseChatModel<VsCodeChatModelCallOptions> {
   }
 
   private toVsCodeMessages(messages: BaseMessage[]): vscode.LanguageModelChatMessage[] {
-    return messages.map((message) => {
+    const systemInstructions = messages
+      .filter((message) => message.getType() === "system")
+      .map((message) => contentToText(message.content))
+      .filter((text) => text.trim())
+      .join("\n\n");
+    let latestUserMessageIndex = -1;
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (
+        message.getType() !== "system" &&
+        !ToolMessage.isInstance(message) &&
+        !AIMessage.isInstance(message)
+      ) {
+        latestUserMessageIndex = index;
+        break;
+      }
+    }
+    let instructionsInjected = false;
+    const converted: vscode.LanguageModelChatMessage[] = [];
+
+    for (const [messageIndex, message] of messages.entries()) {
+      if (message.getType() === "system") {
+        continue;
+      }
       const text = contentToText(message.content);
 
       if (ToolMessage.isInstance(message)) {
@@ -230,11 +264,12 @@ export class VsCodeChatModel extends BaseChatModel<VsCodeChatModelCallOptions> {
             text,
           });
         }
-        return vscode.LanguageModelChatMessage.User([
+        converted.push(vscode.LanguageModelChatMessage.User([
           new vscode.LanguageModelToolResultPart(message.tool_call_id, [
             new vscode.LanguageModelTextPart(text),
           ]),
-        ]);
+        ]));
+        continue;
       }
 
       if (AIMessage.isInstance(message)) {
@@ -251,17 +286,33 @@ export class VsCodeChatModel extends BaseChatModel<VsCodeChatModelCallOptions> {
             ),
           );
         }
-        return vscode.LanguageModelChatMessage.Assistant(parts);
+        converted.push(vscode.LanguageModelChatMessage.Assistant(parts));
+        continue;
       }
 
-      if (message.getType() === "system") {
-        return vscode.LanguageModelChatMessage.User(
-          `<system-instructions>\n${text}\n</system-instructions>`,
-        );
-      }
+      const content =
+        systemInstructions && messageIndex === latestUserMessageIndex
+          ? [
+              "<custom_instructions>",
+              systemInstructions,
+              "</custom_instructions>",
+              "<user-request>",
+              text,
+              "</user-request>",
+            ].join("\n")
+          : text;
+      instructionsInjected = true;
+      converted.push(vscode.LanguageModelChatMessage.User(content));
+    }
 
-      return vscode.LanguageModelChatMessage.User(text);
-    });
+    if (systemInstructions && !instructionsInjected) {
+      converted.unshift(
+        vscode.LanguageModelChatMessage.User(
+          `<custom_instructions>\n${systemInstructions}\n</custom_instructions>`,
+        ),
+      );
+    }
+    return converted;
   }
 
   private toVsCodeTools(tools: ToolDefinition[] | undefined): vscode.LanguageModelChatTool[] {
@@ -287,6 +338,29 @@ export class VsCodeChatModel extends BaseChatModel<VsCodeChatModelCallOptions> {
       },
     };
   }
+}
+
+function extractModelPromptSnapshot(
+  messages: BaseMessage[],
+): ModelPromptSnapshot {
+  const systemPrompt = messages
+    .filter((message) => message.getType() === "system")
+    .map((message) => contentToText(message.content))
+    .filter((text) => text.trim())
+    .join("\n\n");
+  let userPrompt = "";
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (
+      message.getType() !== "system" &&
+      !ToolMessage.isInstance(message) &&
+      !AIMessage.isInstance(message)
+    ) {
+      userPrompt = contentToText(message.content);
+      break;
+    }
+  }
+  return { systemPrompt, userPrompt };
 }
 
 function asRecord(input: object): Record<string, unknown> {
