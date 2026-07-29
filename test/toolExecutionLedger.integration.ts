@@ -3,7 +3,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ToolMessage } from "@langchain/core/messages";
-import { Command, isCommand } from "@langchain/langgraph";
+import {
+  Command,
+  GraphInterrupt,
+  isCommand,
+} from "@langchain/langgraph";
 import { PersistenceService } from "../src/persistence/PersistenceService";
 import {
   ToolExecutionBlockedError,
@@ -176,6 +180,28 @@ async function main(): Promise<void> {
     assert.equal(
       service.toolExecutions.get(runId, "command-1")?.status,
       "failed",
+    );
+
+    const interruptRequest = request("approval-1", "write_file", {
+      file_path: "approval.txt",
+      content: "pending",
+    });
+    const graphInterrupt = new GraphInterrupt([]);
+    await assert.rejects(
+      async () =>
+        middleware.wrapToolCall!(
+          interruptRequest as never,
+          (async () => {
+            throw graphInterrupt;
+          }) as never,
+        ),
+      (error) => error === graphInterrupt,
+      "approval interrupts must bubble through the durable ledger",
+    );
+    assert.equal(
+      service.toolExecutions.get(runId, "approval-1")?.status,
+      "requested",
+      "an interrupted wrapper must be retryable when the graph resumes",
     );
 
     const uncertainArgs = { path: "uncertain.txt" };

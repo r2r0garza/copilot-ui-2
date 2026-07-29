@@ -2,7 +2,12 @@ import * as vscode from "vscode";
 import { relative } from "node:path";
 import { AIMessage, ToolMessage } from "@langchain/core/messages";
 import { Command } from "@langchain/langgraph";
-import { createDeepAgent, FilesystemBackend } from "deepagents";
+import {
+  createDeepAgent,
+  createSubAgentMiddleware,
+  FilesystemBackend,
+  type CompiledSubAgent,
+} from "deepagents";
 import {
   createExecuteCommandTool,
   validateExecuteCommandInput,
@@ -36,8 +41,26 @@ import {
   type AgentToolPolicy,
 } from "./agentToolPolicy";
 import { ProjectAgentRegistry } from "./projectAgentRegistry";
+import {
+  createProjectAgentDelegationGuardMiddleware,
+  PROJECT_AGENT_DELEGATION_SYSTEM_PROMPT,
+  PROJECT_AGENT_TASK_DESCRIPTION,
+  resolveProjectAgentDelegation,
+} from "./projectAgentDelegation";
 import { configureDeepAgentSystemPrompt } from "./deepAgentSystemPrompt";
 import { createProjectSkillsMiddleware } from "./projectSkillsMiddleware";
+import {
+  renderRegisteredLanguageModelToolInventory,
+  snapshotRegisteredLanguageModelTools,
+} from "./vscodeLanguageModelTools";
+import {
+  createAllowedVscodeMcpTools,
+  resolveVscodeMcpTools,
+} from "./vscodeMcpTools";
+import {
+  createAllowedVscodeWebBrowserTools,
+  resolveVscodeWebBrowserTools,
+} from "./vscodeWebBrowserTools";
 
 let currentPanel: DeepAgentsChatPanel | undefined;
 const processAllowedTools = new Map<string, Set<string>>();
@@ -53,6 +76,9 @@ export function activate(context: vscode.ExtensionContext): void {
   );
   const modelCallsOutput = vscode.window.createOutputChannel(
     "Deep Agents Model Calls",
+  );
+  const runtimeToolsOutput = vscode.window.createOutputChannel(
+    "Deep Agents Runtime Tools",
   );
   const openWorkbench = async (): Promise<void> => {
     if (currentPanel) {
@@ -142,6 +168,18 @@ export function activate(context: vscode.ExtensionContext): void {
         }
       },
     ),
+    vscode.commands.registerCommand(
+      "deepagentsSpike.inspectRegisteredTools",
+      () => {
+        runtimeToolsOutput.clear();
+        runtimeToolsOutput.appendLine(
+          renderRegisteredLanguageModelToolInventory(
+            snapshotRegisteredLanguageModelTools(),
+          ),
+        );
+        runtimeToolsOutput.show(true);
+      },
+    ),
     vscode.window.registerWebviewViewProvider(
       WorkbenchSidebarProvider.viewType,
       new WorkbenchSidebarProvider(openWorkbench),
@@ -149,6 +187,7 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
     customizationsOutput,
     modelCallsOutput,
+    runtimeToolsOutput,
   );
 }
 
@@ -171,9 +210,15 @@ function renderProjectCustomizations(
       mcpServerNames: serverNames,
     });
     output.appendLine(
-      `- ${agent.name} [${agent.id}] configured=${configuredTools} resolved=${JSON.stringify(policy.resolvedTools)}`,
+      `- ${agent.name} [${agent.id}] configured=${configuredTools} resolved=${JSON.stringify(policy.resolvedTools)} children=${JSON.stringify(resolveProjectAgentDelegation(agent, discovered).children.map((child) => child.id))}`,
     );
     for (const diagnostic of policy.diagnostics) {
+      policyDiagnosticLines.push(
+        `- ${diagnostic.severity.toUpperCase()} ${relative(discovered.workspaceRoot, agent.filePath)} [${diagnostic.code}] ${diagnostic.message}`,
+      );
+    }
+    for (const diagnostic of resolveProjectAgentDelegation(agent, discovered)
+      .diagnostics) {
       policyDiagnosticLines.push(
         `- ${diagnostic.severity.toUpperCase()} ${relative(discovered.workspaceRoot, agent.filePath)} [${diagnostic.code}] ${diagnostic.message}`,
       );
@@ -192,6 +237,32 @@ function renderProjectCustomizations(
       ? relative(discovered.workspaceRoot, source.filePath)
       : "<unknown>";
     output.appendLine(`- ${serverName} (${sourcePath})`);
+  }
+  const runtimeMcp = resolveVscodeMcpTools(discovered.mcp);
+  output.appendLine("");
+  output.appendLine(`MCP runtime tools (${runtimeMcp.tools.length})`);
+  for (const tool of runtimeMcp.tools) {
+    output.appendLine(`- ${tool.canonicalName} -> ${tool.providerName}`);
+  }
+  for (const diagnostic of runtimeMcp.diagnostics) {
+    policyDiagnosticLines.push(
+      `- ${diagnostic.severity.toUpperCase()} [${diagnostic.code}] ${diagnostic.message}`,
+    );
+  }
+  const runtimeWebBrowser = resolveVscodeWebBrowserTools();
+  output.appendLine("");
+  output.appendLine(
+    `Web/browser runtime tools (${runtimeWebBrowser.tools.length})`,
+  );
+  for (const tool of runtimeWebBrowser.tools) {
+    output.appendLine(
+      `- ${tool.canonicalName} -> ${tool.providerName}${tool.requiresApproval ? " (approval required)" : ""}`,
+    );
+  }
+  for (const diagnostic of runtimeWebBrowser.diagnostics) {
+    policyDiagnosticLines.push(
+      `- ${diagnostic.severity.toUpperCase()} [${diagnostic.code}] ${diagnostic.message}`,
+    );
   }
   output.appendLine("");
   output.appendLine(
@@ -874,31 +945,106 @@ class DeepAgentsChatPanel {
     runId: string,
     agentDefinition: ProjectAgentDefinition,
   ) {
+    const delegation = resolveProjectAgentDelegation(
+      agentDefinition,
+      this.customizations,
+    );
+    const subagents: CompiledSubAgent[] = delegation.children.map((child) => ({
+      name: child.id,
+      description: child.description ?? child.name,
+      runnable: this.createProjectAgentRuntime(
+        adapter,
+        session,
+        runId,
+        child,
+        [],
+        false,
+      ),
+    }));
+    return this.createProjectAgentRuntime(
+      adapter,
+      session,
+      runId,
+      agentDefinition,
+      subagents,
+      true,
+    );
+  }
+
+  private createProjectAgentRuntime(
+    adapter: VsCodeChatModel,
+    session: ChatSession,
+    runId: string,
+    agentDefinition: ProjectAgentDefinition,
+    subagents: CompiledSubAgent[],
+    persistCheckpoints: boolean,
+  ) {
     const configuredPolicy = resolveAgentToolPolicy(agentDefinition.tools, {
       mcpServerNames: Object.keys(this.customizations.mcp?.servers ?? {}),
     });
     const policy: AgentToolPolicy = {
       ...configuredPolicy,
       allows(toolName: string): boolean {
-        return toolName !== "task" && configuredPolicy.allows(toolName);
+        return (
+          configuredPolicy.allows(toolName) &&
+          (toolName !== "task" || subagents.length > 0)
+        );
       },
     };
+    const mcp = createAllowedVscodeMcpTools(
+      this.customizations.mcp,
+      policy,
+    );
+    const webBrowser = createAllowedVscodeWebBrowserTools(policy);
+    const modelNameAliases = new Map([
+      ...mcp.modelNameAliases,
+      ...webBrowser.modelNameAliases,
+    ]);
+    const browserApprovalInterrupts = Object.fromEntries(
+      webBrowser.approvalProviderNames.map((providerName) => [
+        providerName,
+        {
+          allowedDecisions: ["approve", "reject"],
+          description:
+            "Review this interactive browser action. It may submit data, confirm an external action, or change remote page state.",
+          when: ({ toolCall }: { toolCall: { name: string } }) =>
+            !session.allowedTools.has(toolCall.name),
+        },
+      ]),
+    );
     return createDeepAgent({
       model: adapter,
       name: agentDefinition.id,
-      tools: policy.allows("execute_command")
-        ? [
-            createExecuteCommandTool({
-              workspaceRoot: this.workspaceRoot,
-            }),
-          ]
-        : [],
+      tools: [
+        ...(policy.allows("execute_command")
+          ? [
+              createExecuteCommandTool({
+                workspaceRoot: this.workspaceRoot,
+              }),
+            ]
+          : []),
+        ...mcp.tools,
+        ...webBrowser.tools,
+      ],
       backend: new FilesystemBackend({
         rootDir: this.workspaceRoot,
         virtualMode: true,
       }),
       middleware: [
-        createAgentToolPolicyMiddleware(policy),
+        createSubAgentMiddleware({
+          defaultModel: adapter,
+          subagents,
+          generalPurposeAgent: false,
+          systemPrompt: PROJECT_AGENT_DELEGATION_SYSTEM_PROMPT,
+          taskDescription: PROJECT_AGENT_TASK_DESCRIPTION,
+        }),
+        createProjectAgentDelegationGuardMiddleware(
+          subagents.map((subagent) => subagent.name),
+        ),
+        createAgentToolPolicyMiddleware(
+          policy,
+          modelNameAliases,
+        ),
         createProjectSkillsMiddleware(
           this.customizations.skills,
           this.workspaceRoot,
@@ -908,7 +1054,9 @@ class DeepAgentsChatPanel {
           runId,
         }),
       ],
-      checkpointer: this.persistence.checkpointer,
+      ...(persistCheckpoints
+        ? { checkpointer: this.persistence.checkpointer }
+        : {}),
       interruptOn: {
         write_file: {
           allowedDecisions: ["approve", "reject"],
@@ -926,6 +1074,7 @@ class DeepAgentsChatPanel {
             "Review this command carefully. It runs directly on the host in the current workspace.",
           when: ({ toolCall }) => !session.allowedTools.has(toolCall.name),
         },
+        ...browserApprovalInterrupts,
       },
       systemPrompt: configureDeepAgentSystemPrompt(
         agentDefinition.body,
@@ -2560,6 +2709,10 @@ function renderWebview(
           break;
         case "toolResult":
           addActivity(data.id, data.label, data.text);
+          // A tool result closes the current model/tool segment. The next text
+          // belongs to a fresh model response (including parent text after a
+          // delegated child's final response), so it needs a new bubble.
+          draft = null;
           break;
         case "approvalRequested":
           addApproval(data.requestId, data.actions, data.allowSession);

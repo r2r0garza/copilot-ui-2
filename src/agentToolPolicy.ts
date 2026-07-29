@@ -158,7 +158,12 @@ export function resolveAgentToolPolicy(
   );
 }
 
-export function createAgentToolPolicyMiddleware(policy: AgentToolPolicy) {
+export function createAgentToolPolicyMiddleware(
+  policy: AgentToolPolicy,
+  modelNameAliases: ReadonlyMap<string, string> = new Map(),
+) {
+  const canonicalName = (modelName: string): string =>
+    modelNameAliases.get(modelName) ?? modelName;
   return createMiddleware({
     name: "AgentToolPolicy",
     wrapModelCall(request, handler) {
@@ -166,18 +171,20 @@ export function createAgentToolPolicyMiddleware(policy: AgentToolPolicy) {
         ...request,
         tools: request.tools?.filter(
           (tool) =>
-            !hasToolName(tool) || policy.allows(tool.name),
+            !hasToolName(tool) ||
+            policy.allows(canonicalName(tool.name)),
         ),
       });
     },
     wrapToolCall(request, handler) {
-      if (policy.allows(request.toolCall.name)) {
+      if (policy.allows(canonicalName(request.toolCall.name))) {
         return handler(request);
       }
+      const policyToolName = canonicalName(request.toolCall.name);
       return new ToolMessage({
-        content: `Tool "${request.toolCall.name}" is not allowed by this agent's tools policy.`,
+        content: `Tool "${policyToolName}" is not allowed by this agent's tools policy.`,
         tool_call_id: request.toolCall.id ?? "missing-tool-call-id",
-        name: request.toolCall.name,
+        name: policyToolName,
         status: "error",
       });
     },

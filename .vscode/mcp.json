@@ -1,0 +1,11 @@
+{
+  "servers": {
+    "bridgit-runtime-fixture": {
+      "type": "stdio",
+      "command": "${env:HOME}/.local/bin/node",
+      "args": [
+        "${workspaceFolder}/.planning/003-runtime-capabilities/fixtures/mcp-server.mjs"
+      ]
+    }
+  }
+}

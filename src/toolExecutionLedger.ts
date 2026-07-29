@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
 import { ToolMessage } from "@langchain/core/messages";
-import { Command, isCommand } from "@langchain/langgraph";
+import {
+  Command,
+  isCommand,
+  isGraphInterrupt,
+} from "@langchain/langgraph";
 import { createMiddleware, type ToolCallRequest } from "langchain";
 import {
   ToolExecutionBlockedError,
@@ -57,6 +61,17 @@ export function createToolExecutionLedgerMiddleware(input: {
         );
         return result;
       } catch (error) {
+        if (isGraphInterrupt(error)) {
+          // An approval interrupt is control flow, not a tool failure. The graph
+          // will restart this wrapper when it resumes, so return the durable
+          // record to a retryable state and allow the interrupt to bubble up.
+          input.repository.transition(
+            input.runId,
+            toolCallId,
+            "requested",
+          );
+          throw error;
+        }
         if (
           error instanceof ToolExecutionIntegrityError ||
           error instanceof ToolExecutionBlockedError

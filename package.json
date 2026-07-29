@@ -40,6 +40,10 @@
       {
         "command": "deepagentsSpike.inspectProjectCustomizations",
         "title": "Deep Agents: Inspect Project Customizations"
+      },
+      {
+        "command": "deepagentsSpike.inspectRegisteredTools",
+        "title": "Deep Agents: Inspect Registered Tools"
       }
     ],
     "configuration": {
@@ -69,6 +73,7 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@types/node": "^22.0.0",
     "@types/vscode": "1.105.0",
     "esbuild": "^0.25.0",
