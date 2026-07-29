@@ -6,6 +6,7 @@ const tests = [
   "approval.integration",
   "conversationReplayProjection.test",
   "executeCommandTool.test",
+  "projectCustomizations.test",
   "command.integration",
   "sqliteCheckpointer.integration",
   "toolExecutionLedger.integration",

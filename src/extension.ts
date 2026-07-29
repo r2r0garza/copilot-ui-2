@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { relative } from "node:path";
 import { AIMessage, ToolMessage } from "@langchain/core/messages";
 import { Command } from "@langchain/langgraph";
 import { createDeepAgent, FilesystemBackend } from "deepagents";
@@ -20,6 +21,10 @@ import {
   encodeToolResult,
   hashToolInput,
 } from "./toolExecutionLedger";
+import {
+  discoverProjectCustomizations,
+  type ProjectCustomizations,
+} from "./projectCustomizations";
 
 let currentPanel: DeepAgentsChatPanel | undefined;
 const processAllowedTools = new Map<string, Set<string>>();
@@ -41,6 +46,9 @@ const AGENT_SYSTEM_PROMPT = [
 export function activate(context: vscode.ExtensionContext): void {
   let persistence: PersistenceService | undefined;
   const processInstanceId = crypto.randomUUID();
+  const customizationsOutput = vscode.window.createOutputChannel(
+    "Deep Agents Customizations",
+  );
   const openWorkbench = async (): Promise<void> => {
     if (currentPanel) {
       currentPanel.reveal();
@@ -93,15 +101,77 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand("deepagentsSpike.openChat", openWorkbench),
+    vscode.commands.registerCommand(
+      "deepagentsSpike.inspectProjectCustomizations",
+      async () => {
+        const workspaceRoot =
+          vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        if (!workspaceRoot) {
+          void vscode.window.showErrorMessage(
+            "Open a workspace before inspecting Deep Agents customizations.",
+          );
+          return;
+        }
+
+        try {
+          const discovered =
+            await discoverProjectCustomizations(workspaceRoot);
+          renderProjectCustomizations(customizationsOutput, discovered);
+          customizationsOutput.show(true);
+        } catch (error) {
+          void vscode.window.showErrorMessage(
+            `Unable to inspect project customizations: ${formatError(error)}`,
+          );
+        }
+      },
+    ),
     vscode.window.registerWebviewViewProvider(
       WorkbenchSidebarProvider.viewType,
       new WorkbenchSidebarProvider(openWorkbench),
       { webviewOptions: { retainContextWhenHidden: true } },
     ),
+    customizationsOutput,
   );
 }
 
 export function deactivate(): void {}
+
+function renderProjectCustomizations(
+  output: vscode.OutputChannel,
+  discovered: ProjectCustomizations,
+): void {
+  output.clear();
+  output.appendLine(`Workspace: ${discovered.workspaceRoot}`);
+  output.appendLine("");
+  output.appendLine(`Agents (${discovered.agents.length})`);
+  for (const agent of discovered.agents) {
+    const tools =
+      agent.tools === undefined ? "<all>" : JSON.stringify(agent.tools);
+    output.appendLine(`- ${agent.name} [${agent.id}] tools=${tools}`);
+  }
+  output.appendLine("");
+  output.appendLine(`Skills (${discovered.skills.length})`);
+  for (const skill of discovered.skills) {
+    output.appendLine(`- ${skill.name}: ${skill.description}`);
+  }
+  output.appendLine("");
+  const serverNames = Object.keys(discovered.mcp?.servers ?? {}).sort();
+  output.appendLine(`MCP servers (${serverNames.length})`);
+  for (const serverName of serverNames) {
+    const source = discovered.mcp?.sources[serverName];
+    const sourcePath = source
+      ? relative(discovered.workspaceRoot, source.filePath)
+      : "<unknown>";
+    output.appendLine(`- ${serverName} (${sourcePath})`);
+  }
+  output.appendLine("");
+  output.appendLine(`Diagnostics (${discovered.diagnostics.length})`);
+  for (const diagnostic of discovered.diagnostics) {
+    output.appendLine(
+      `- ${diagnostic.severity.toUpperCase()} ${diagnostic.path} [${diagnostic.code}] ${diagnostic.message}`,
+    );
+  }
+}
 
 async function selectCopilotModels(): Promise<vscode.LanguageModelChat[]> {
   const family = vscode.workspace
