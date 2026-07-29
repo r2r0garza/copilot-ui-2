@@ -66,12 +66,21 @@ export interface RunStatusReplayItem extends ReplayItemBase {
   message: string;
 }
 
+export interface SteeringReplayItem extends ReplayItemBase {
+  kind: "steering_message";
+  steeringId: string;
+  content: string;
+  status: "queued" | "injected" | "discarded";
+  discardReason: string | null;
+}
+
 export type ConversationReplayItem =
   | MessageReplayItem
   | ToolCallReplayItem
   | ToolResultReplayItem
   | ApprovalRequestedReplayItem
   | ApprovalResolvedReplayItem
+  | SteeringReplayItem
   | RunStatusReplayItem;
 
 interface ApprovalResolution {
@@ -98,12 +107,26 @@ export function projectConversationEvents(
     .map(({ event }) => event);
 
   const approvalResolutions = new Map<string, ApprovalResolution>();
+  const steeringOutcomes = new Map<
+    string,
+    { status: "injected" | "discarded"; reason: string | null }
+  >();
   for (const event of orderedEvents) {
     if (event.eventType === "approval_resolved") {
       approvalResolutions.set(
         stringValue(event.payload.requestId),
         { decision: stringValue(event.payload.decision) },
       );
+    } else if (event.eventType === "steering_injected") {
+      steeringOutcomes.set(stringValue(event.payload.steeringId), {
+        status: "injected",
+        reason: null,
+      });
+    } else if (event.eventType === "steering_discarded") {
+      steeringOutcomes.set(stringValue(event.payload.steeringId), {
+        status: "discarded",
+        reason: nullableString(event.payload.reason),
+      });
     }
   }
 
@@ -208,6 +231,24 @@ export function projectConversationEvents(
         });
         break;
       }
+
+      case "steering_message": {
+        const steeringId = stringValue(event.payload.steeringId);
+        const outcome = steeringOutcomes.get(steeringId);
+        items.push({
+          ...base,
+          kind: "steering_message",
+          steeringId,
+          content: stringValue(event.payload.content),
+          status: outcome?.status ?? "queued",
+          discardReason: outcome?.reason ?? null,
+        });
+        break;
+      }
+
+      case "steering_injected":
+      case "steering_discarded":
+        break;
 
       case "run_error":
         items.push({

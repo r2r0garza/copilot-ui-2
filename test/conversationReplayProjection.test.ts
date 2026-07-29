@@ -81,13 +81,53 @@ const events = [
     schemaVersion: 1,
     modelKey: "vendor:model",
   }),
+  event(10, "steering_message", {
+    schemaVersion: 1,
+    steeringId: "steer-1",
+    content: "Focus on the unit tests.",
+  }),
+  event(11, "steering_injected", {
+    schemaVersion: 1,
+    steeringId: "steer-1",
+    boundary: 1,
+  }),
+  event(12, "steering_message", {
+    schemaVersion: 1,
+    steeringId: "steer-2",
+    content: "Ignore this late update.",
+  }),
+  event(13, "steering_discarded", {
+    schemaVersion: 1,
+    steeringId: "steer-2",
+    reason: "cancelled",
+  }),
 ];
 
 const projected = projectConversationEvents(events);
 assert.deepEqual(
   projected.map((item) => item.sequence),
-  [1, 2, 3, 4, 5, 6, 7, 8],
+  [1, 2, 3, 4, 5, 6, 7, 8, 10, 12],
   "projected activity is ordered by persisted sequence",
+);
+const steering = byKind(projected, "steering_message");
+assert.deepEqual(
+  steering.map(({ content, status, discardReason }) => ({
+    content,
+    status,
+    discardReason,
+  })),
+  [
+    {
+      content: "Focus on the unit tests.",
+      status: "injected",
+      discardReason: null,
+    },
+    {
+      content: "Ignore this late update.",
+      status: "discarded",
+      discardReason: "cancelled",
+    },
+  ],
 );
 assert.deepEqual(
   byKind(projected, "message").map(({ role, content }) => ({ role, content })),
@@ -193,7 +233,10 @@ assert.deepEqual(byKind(edgeCases, "run_status")[0], {
   message: "Cancelled.",
 });
 
-assert.deepEqual(events.map((item) => item.sequence), [8, 2, 1, 3, 4, 5, 6, 7, 9]);
+assert.deepEqual(
+  events.map((item) => item.sequence),
+  [8, 2, 1, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13],
+);
 
 console.log(
   "Conversation replay projection test passed: ordered inert history, collapsed tools, orphan safety, statuses, and truncation metadata",

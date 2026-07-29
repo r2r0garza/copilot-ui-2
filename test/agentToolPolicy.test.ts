@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
-import { resolveAgentToolPolicy } from "../src/agentToolPolicy";
+import {
+  renderAgentToolCapabilityPrompt,
+  renderAgentToolPolicyBlock,
+  resolveAgentToolPolicy,
+} from "../src/agentToolPolicy";
 
 function main(): void {
   const omitted = resolveAgentToolPolicy(undefined);
@@ -86,8 +90,28 @@ function main(): void {
   );
   assert.deepEqual(unknown.resolvedTools, []);
 
+  const capabilityPrompt = renderAgentToolCapabilityPrompt(
+    granular,
+    ["read_file", "web/fetch"],
+  );
+  assert.match(
+    capabilityPrompt,
+    /Tools exposed for this model call: read_file, web\/fetch/,
+  );
+  assert.match(capabilityPrompt, /currently unavailable:.*write_file/);
+  assert.match(capabilityPrompt, /inventory is authoritative/);
+
+  const noToolsPrompt = renderAgentToolCapabilityPrompt(omitted, []);
+  assert.match(noToolsPrompt, /Tools exposed for this model call: none/);
+  assert.match(noToolsPrompt, /selected agent has no usable tools/);
+
+  const policyBlock = renderAgentToolPolicyBlock("write_file", omitted);
+  assert.match(policyBlock, /was not executed/);
+  assert.match(policyBlock, /Configured capabilities for this agent: none/);
+  assert.match(policyBlock, /Do not retry/);
+
   console.log(
-    "Agent tool policy test passed: fail-closed defaults, aliases, granular tools, MCP selectors, and diagnostics",
+    "Agent tool policy test passed: fail-closed defaults, aliases, granular tools, MCP selectors, capability guidance, and diagnostics",
   );
 }
 

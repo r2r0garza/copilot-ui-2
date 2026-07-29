@@ -52,9 +52,36 @@ async function main(): Promise<void> {
         payload: { schemaVersion: 1, reason: `fixture-${index}` },
       });
     }
+    service.conversationEvents.append({
+      sessionId: first.id,
+      eventType: "steering_message",
+      payload: {
+        schemaVersion: 1,
+        steeringId: "steer-1",
+        content: "Persist this steering update.",
+      },
+    });
+    service.conversationEvents.append({
+      sessionId: first.id,
+      eventType: "steering_injected",
+      payload: {
+        schemaVersion: 1,
+        steeringId: "steer-1",
+        boundary: 1,
+      },
+    });
+    service.conversationEvents.append({
+      sessionId: first.id,
+      eventType: "steering_discarded",
+      payload: {
+        schemaVersion: 1,
+        steeringId: "steer-2",
+        reason: "cancelled",
+      },
+    });
     assert.deepEqual(
       service.conversationEvents.list(first.id).map((event) => event.sequence),
-      Array.from({ length: 22 }, (_, index) => index + 1),
+      Array.from({ length: 25 }, (_, index) => index + 1),
     );
     assert.equal(service.sessions.list()[0].id, first.id);
 

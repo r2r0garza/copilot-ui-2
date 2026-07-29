@@ -61,6 +61,19 @@ import {
   createAllowedVscodeWebBrowserTools,
   resolveVscodeWebBrowserTools,
 } from "./vscodeWebBrowserTools";
+import { resolveComposerControlState } from "./composerState";
+import {
+  createSteeringMiddleware,
+  pendingSteeringEntriesFromEvents,
+  SteeringQueue,
+  type SteeringEntry,
+  type SteeringInjection,
+} from "./steeringQueue";
+import { createRepeatedToolFailureMiddleware } from "./repeatedToolFailure";
+import {
+  collectRuntimeDiagnostics,
+  renderRuntimeDiagnostics,
+} from "./runtimeDiagnostics";
 
 let currentPanel: DeepAgentsChatPanel | undefined;
 const processAllowedTools = new Map<string, Set<string>>();
@@ -178,6 +191,42 @@ export function activate(context: vscode.ExtensionContext): void {
           ),
         );
         runtimeToolsOutput.show(true);
+      },
+    ),
+    vscode.commands.registerCommand(
+      "deepagentsSpike.inspectRuntimeDiagnostics",
+      async () => {
+        const workspaceRoot =
+          vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        if (!workspaceRoot) {
+          void vscode.window.showErrorMessage(
+            "Open a workspace before inspecting Deep Agents runtime diagnostics.",
+          );
+          return;
+        }
+        try {
+          const [models, customizations] = await Promise.all([
+            vscode.lm.selectChatModels({ vendor: "copilot" }),
+            discoverProjectCustomizations(workspaceRoot),
+          ]);
+          runtimeToolsOutput.clear();
+          runtimeToolsOutput.appendLine(
+            renderRuntimeDiagnostics(
+              collectRuntimeDiagnostics({
+                models,
+                registeredTools: vscode.lm.tools,
+                extensions: vscode.extensions.all,
+                vscodeVersion: vscode.version,
+                mcpConfiguration: customizations.mcp,
+              }),
+            ),
+          );
+          runtimeToolsOutput.show(true);
+        } catch (error) {
+          void vscode.window.showErrorMessage(
+            `Unable to inspect runtime diagnostics: ${formatError(error)}`,
+          );
+        }
       },
     ),
     vscode.window.registerWebviewViewProvider(
@@ -335,6 +384,13 @@ class DeepAgentsChatPanel {
       }
     | undefined;
   private running = false;
+  private activeSteering:
+    | {
+        runId: string;
+        sessionId: string;
+        queue: SteeringQueue;
+      }
+    | undefined;
 
   constructor(
     context: vscode.ExtensionContext,
@@ -468,6 +524,50 @@ class DeepAgentsChatPanel {
     if (raw.type === "cancel") {
       this.cancellation?.abort();
       this.resolvePendingApproval("deny");
+      return;
+    }
+    if (raw.type === "steer") {
+      const active = this.activeSteering;
+      const text = raw.text.trim();
+      if (
+        !this.running ||
+        !active ||
+        active.sessionId !== this.activeSession.id ||
+        !text
+      ) {
+        await this.post({
+          type: "steeringRejected",
+          requestId: raw.requestId,
+          reason: "No active run can accept this steering message.",
+        });
+        return;
+      }
+      const result = active.queue.enqueue(raw.requestId, text);
+      if (result.kind === "closed") {
+        await this.post({
+          type: "steeringRejected",
+          requestId: raw.requestId,
+          reason: "The active run has already reached its final model boundary.",
+        });
+        return;
+      }
+      if (result.kind === "accepted") {
+        this.persistence.conversationEvents.append({
+          sessionId: active.sessionId,
+          runId: active.runId,
+          eventType: "steering_message",
+          payload: {
+            schemaVersion: 1,
+            steeringId: result.entry.id,
+            content: result.entry.text,
+          },
+        });
+      }
+      await this.post({
+        type: "steeringAccepted",
+        requestId: result.entry.id,
+        text: result.entry.text,
+      });
       return;
     }
     if (raw.type === "approval") {
@@ -643,6 +743,10 @@ class DeepAgentsChatPanel {
       leaseExpiresAt: leaseExpiration(),
       compatibilityVersion: CURRENT_GRAPH_COMPATIBILITY_VERSION,
     });
+    const steeringQueue = this.activateSteeringQueue(
+      runId,
+      session.id,
+    );
     const heartbeat = setInterval(() => {
       try {
         this.persistence.runs.heartbeat(attemptId, leaseExpiration());
@@ -685,7 +789,13 @@ class DeepAgentsChatPanel {
       },
     });
 
-    const agent = this.createAgent(adapter, session, runId, selectedAgent);
+    const agent = this.createAgent(
+      adapter,
+      session,
+      runId,
+      selectedAgent,
+      steeringQueue,
+    );
 
     try {
       const runConfig = {
@@ -700,19 +810,45 @@ class DeepAgentsChatPanel {
       );
       await this.recordLatestCheckpoint(runId, session);
 
-      let approvalRequest = extractApprovalRequest(result);
-      while (approvalRequest) {
-        const actions = approvalRequest.actions;
-        const decisions = await this.reviewApprovalActions(
-          actions,
-          runId,
-          session,
-        );
-        const resume = { decisions };
-        result = await agent.invoke(new Command({ resume }), runConfig);
-        this.persistence.runs.setExecutionStatus(runId, "running");
+      while (true) {
+        let approvalRequest = extractApprovalRequest(result);
+        while (approvalRequest) {
+          const actions = approvalRequest.actions;
+          const decisions = await this.reviewApprovalActions(
+            actions,
+            runId,
+            session,
+          );
+          const resume = { decisions };
+          result = await agent.invoke(new Command({ resume }), runConfig);
+          this.persistence.runs.setExecutionStatus(runId, "running");
+          await this.recordLatestCheckpoint(runId, session);
+          approvalRequest = extractApprovalRequest(result);
+        }
+        if (steeringQueue.closeIfEmpty()) {
+          break;
+        }
+        const intermediateMessage = [...(result.messages ?? [])]
+          .reverse()
+          .find((message) => AIMessage.isInstance(message));
+        const intermediateText = intermediateMessage
+          ? messageText(intermediateMessage.content)
+          : "";
+        if (intermediateText) {
+          session.transcript.push({
+            role: "assistant",
+            content: intermediateText,
+          });
+          this.persistence.conversationEvents.append({
+            sessionId: session.id,
+            runId,
+            eventType: "assistant_message",
+            payload: { schemaVersion: 1, content: intermediateText },
+          });
+        }
+        await this.post({ type: "modelBoundary" });
+        result = await agent.invoke({ messages: [] }, runConfig);
         await this.recordLatestCheckpoint(runId, session);
-        approvalRequest = extractApprovalRequest(result);
       }
 
       const messages = result.messages ?? [];
@@ -730,6 +866,10 @@ class DeepAgentsChatPanel {
     } catch (error) {
       const cancelled = this.cancellation.signal.aborted;
       const message = cancelled ? "Cancelled." : formatError(error);
+      await this.discardSteeringQueue(
+        runId,
+        cancelled ? "cancelled" : "failed",
+      );
       session.transcript.push({ role: "assistant", content: message });
       this.persistence.conversationEvents.append({
         sessionId: session.id,
@@ -753,6 +893,7 @@ class DeepAgentsChatPanel {
       clearInterval(heartbeat);
       this.running = false;
       this.cancellation = undefined;
+      this.clearSteeringQueue(runId);
     }
   }
 
@@ -797,6 +938,11 @@ class DeepAgentsChatPanel {
         leaseExpiresAt: leaseExpiration(),
         allowedRecoveryClasses: ["waiting_for_approval"],
       });
+      const steeringQueue = this.activateSteeringQueue(
+        runId,
+        session.id,
+        this.restorePendingSteering(runId, session.id),
+      );
       attemptId = resumed.attemptId;
       heartbeat = setInterval(() => {
         try {
@@ -842,7 +988,13 @@ class DeepAgentsChatPanel {
           void this.postAdapterEvent(event, runId, session.id);
         },
       });
-      const agent = this.createAgent(adapter, session, runId, selectedAgent);
+      const agent = this.createAgent(
+        adapter,
+        session,
+        runId,
+        selectedAgent,
+        steeringQueue,
+      );
       const runConfig = {
         configurable: {
           thread_id: resumed.run.threadId,
@@ -871,20 +1023,46 @@ class DeepAgentsChatPanel {
       this.persistence.runs.setExecutionStatus(runId, "running");
       await this.recordLatestCheckpoint(runId, session);
 
-      let nextApproval = extractApprovalRequest(result);
-      while (nextApproval) {
-        const nextDecisions = await this.reviewApprovalActions(
-          nextApproval.actions,
-          runId,
-          session,
-        );
-        result = await agent.invoke(
-          new Command({ resume: { decisions: nextDecisions } }),
-          runConfig,
-        );
-        this.persistence.runs.setExecutionStatus(runId, "running");
+      while (true) {
+        let nextApproval = extractApprovalRequest(result);
+        while (nextApproval) {
+          const nextDecisions = await this.reviewApprovalActions(
+            nextApproval.actions,
+            runId,
+            session,
+          );
+          result = await agent.invoke(
+            new Command({ resume: { decisions: nextDecisions } }),
+            runConfig,
+          );
+          this.persistence.runs.setExecutionStatus(runId, "running");
+          await this.recordLatestCheckpoint(runId, session);
+          nextApproval = extractApprovalRequest(result);
+        }
+        if (steeringQueue.closeIfEmpty()) {
+          break;
+        }
+        const intermediateMessage = [...(result.messages ?? [])]
+          .reverse()
+          .find((message) => AIMessage.isInstance(message));
+        const intermediateText = intermediateMessage
+          ? messageText(intermediateMessage.content)
+          : "";
+        if (intermediateText) {
+          session.transcript.push({
+            role: "assistant",
+            content: intermediateText,
+          });
+          this.persistence.conversationEvents.append({
+            sessionId: session.id,
+            runId,
+            eventType: "assistant_message",
+            payload: { schemaVersion: 1, content: intermediateText },
+          });
+        }
+        await this.post({ type: "modelBoundary" });
+        result = await agent.invoke({ messages: [] }, runConfig);
         await this.recordLatestCheckpoint(runId, session);
-        nextApproval = extractApprovalRequest(result);
       }
 
       const messages = result.messages ?? [];
@@ -911,6 +1089,10 @@ class DeepAgentsChatPanel {
     } catch (error) {
       const cancelled = this.cancellation.signal.aborted;
       const message = cancelled ? "Cancelled." : formatError(error);
+      await this.discardSteeringQueue(
+        runId,
+        cancelled ? "cancelled" : "failed",
+      );
       if (attemptId) {
         session.transcript.push({ role: "assistant", content: message });
         this.persistence.conversationEvents.append({
@@ -936,6 +1118,84 @@ class DeepAgentsChatPanel {
       }
       this.running = false;
       this.cancellation = undefined;
+      this.clearSteeringQueue(runId);
+    }
+  }
+
+  private activateSteeringQueue(
+    runId: string,
+    sessionId: string,
+    restoredEntries: readonly SteeringEntry[] = [],
+  ): SteeringQueue {
+    const queue = new SteeringQueue(restoredEntries);
+    this.activeSteering = { runId, sessionId, queue };
+    return queue;
+  }
+
+  private recordSteeringInjection(
+    runId: string,
+    sessionId: string,
+    injection: SteeringInjection,
+  ): void {
+    for (const entry of injection.entries) {
+      this.persistence.conversationEvents.append({
+        sessionId,
+        runId,
+        eventType: "steering_injected",
+        payload: {
+          schemaVersion: 1,
+          steeringId: entry.id,
+          boundary: injection.boundary,
+        },
+      });
+      void this.post({
+        type: "steeringInjected",
+        requestId: entry.id,
+        boundary: injection.boundary,
+      });
+    }
+  }
+
+  private async discardSteeringQueue(
+    runId: string,
+    reason: "cancelled" | "failed",
+  ): Promise<void> {
+    const active = this.activeSteering;
+    if (!active || active.runId !== runId) {
+      return;
+    }
+    for (const entry of active.queue.discardPending()) {
+      this.persistence.conversationEvents.append({
+        sessionId: active.sessionId,
+        runId,
+        eventType: "steering_discarded",
+        payload: {
+          schemaVersion: 1,
+          steeringId: entry.id,
+          reason,
+        },
+      });
+      await this.post({
+        type: "steeringDiscarded",
+        requestId: entry.id,
+        reason,
+      });
+    }
+  }
+
+  private restorePendingSteering(
+    runId: string,
+    sessionId: string,
+  ): SteeringEntry[] {
+    return pendingSteeringEntriesFromEvents(
+      this.persistence.conversationEvents.list(sessionId),
+      runId,
+    );
+  }
+
+  private clearSteeringQueue(runId: string): void {
+    if (this.activeSteering?.runId === runId) {
+      this.activeSteering = undefined;
     }
   }
 
@@ -944,6 +1204,7 @@ class DeepAgentsChatPanel {
     session: ChatSession,
     runId: string,
     agentDefinition: ProjectAgentDefinition,
+    steeringQueue: SteeringQueue,
   ) {
     const delegation = resolveProjectAgentDelegation(
       agentDefinition,
@@ -959,6 +1220,7 @@ class DeepAgentsChatPanel {
         child,
         [],
         false,
+        undefined,
       ),
     }));
     return this.createProjectAgentRuntime(
@@ -968,6 +1230,7 @@ class DeepAgentsChatPanel {
       agentDefinition,
       subagents,
       true,
+      steeringQueue,
     );
   }
 
@@ -978,6 +1241,7 @@ class DeepAgentsChatPanel {
     agentDefinition: ProjectAgentDefinition,
     subagents: CompiledSubAgent[],
     persistCheckpoints: boolean,
+    steeringQueue: SteeringQueue | undefined,
   ) {
     const configuredPolicy = resolveAgentToolPolicy(agentDefinition.tools, {
       mcpServerNames: Object.keys(this.customizations.mcp?.servers ?? {}),
@@ -1031,6 +1295,7 @@ class DeepAgentsChatPanel {
         virtualMode: true,
       }),
       middleware: [
+        createRepeatedToolFailureMiddleware(),
         createSubAgentMiddleware({
           defaultModel: adapter,
           subagents,
@@ -1041,6 +1306,19 @@ class DeepAgentsChatPanel {
         createProjectAgentDelegationGuardMiddleware(
           subagents.map((subagent) => subagent.name),
         ),
+        ...(steeringQueue
+          ? [
+              createSteeringMiddleware(
+                steeringQueue,
+                (injection) =>
+                  this.recordSteeringInjection(
+                    runId,
+                    session.id,
+                    injection,
+                  ),
+              ),
+            ]
+          : []),
         createAgentToolPolicyMiddleware(
           policy,
           modelNameAliases,
@@ -1526,6 +1804,7 @@ class DeepAgentsChatPanel {
 type WebviewMessage =
   | { type: "ready" }
   | { type: "send"; text: string }
+  | { type: "steer"; requestId: string; text: string }
   | { type: "cancel" }
   | { type: "clear" }
   | { type: "selectModel"; modelKey: string }
@@ -1615,6 +1894,13 @@ function isWebviewMessage(value: unknown): value is WebviewMessage {
   }
   if (type === "resumePendingApproval") {
     return typeof (value as { runId?: unknown }).runId === "string";
+  }
+  if (type === "steer") {
+    const message = value as { requestId?: unknown; text?: unknown };
+    return (
+      typeof message.requestId === "string" &&
+      typeof message.text === "string"
+    );
   }
   return type === "send" && typeof (value as { text?: unknown }).text === "string";
 }
@@ -2110,6 +2396,23 @@ function renderWebview(
       background: var(--vscode-editorWidget-background);
       border: 1px solid var(--vscode-widget-border);
     }
+    .message.steering {
+      border: 1px dashed var(--vscode-focusBorder);
+    }
+    .message.steering::before {
+      content: "Steering";
+      display: block;
+      margin-bottom: 4px;
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      opacity: .75;
+    }
+    .message.steering.discarded {
+      opacity: .65;
+      text-decoration: line-through;
+    }
     .activity {
       align-self: stretch;
       border-left: 2px solid var(--vscode-progressBar-background);
@@ -2194,7 +2497,17 @@ function renderWebview(
       gap: 8px;
       margin-top: 8px;
     }
-    .send-actions { display: flex; gap: 8px; }
+    .primary-actions { display: flex; gap: 8px; }
+    #primary-action {
+      width: 34px;
+      height: 30px;
+      padding: 0;
+      display: inline-grid;
+      place-items: center;
+      border-radius: 4px;
+      font-size: 18px;
+      line-height: 1;
+    }
     .selectors {
       display: flex;
       flex-wrap: wrap;
@@ -2209,7 +2522,6 @@ function renderWebview(
       border: 1px solid var(--vscode-dropdown-border);
       font: inherit;
     }
-    #cancel { display: none; }
     @media (max-width: 720px) {
       .workbench { grid-template-columns: 180px minmax(0, 1fr); }
     }
@@ -2243,9 +2555,10 @@ function renderWebview(
             <select id="agent-select" aria-label="Project agent"></select>
             <select id="model-select" aria-label="Language model"></select>
           </div>
-          <div class="send-actions">
-            <button id="cancel" class="secondary" type="button">Cancel</button>
-            <button id="send" type="submit">Send</button>
+          <div class="primary-actions">
+            <button id="primary-action" type="submit" title="Send message" aria-label="Send message">
+              <span aria-hidden="true">→</span>
+            </button>
           </div>
         </div>
       </form>
@@ -2256,8 +2569,7 @@ function renderWebview(
     const messages = document.getElementById("messages");
     const form = document.getElementById("form");
     const prompt = document.getElementById("prompt");
-    const send = document.getElementById("send");
-    const cancel = document.getElementById("cancel");
+    const primaryAction = document.getElementById("primary-action");
     const clear = document.getElementById("clear");
     const newChat = document.getElementById("new-chat");
     const sessionList = document.getElementById("session-list");
@@ -2267,9 +2579,22 @@ function renderWebview(
     let draft = null;
     let running = false;
     let currentSessionId = "";
+    const pendingSteering = new Map();
+    const resolveComposerControlState =
+      ${resolveComposerControlState.toString()};
 
-    function updateSendAvailability() {
-      send.disabled = running || !agentSelect.value;
+    function updateComposerControl() {
+      const state = resolveComposerControlState(
+        running,
+        prompt.value,
+        Boolean(agentSelect.value),
+      );
+      primaryAction.dataset.action = state.action;
+      primaryAction.disabled = state.disabled;
+      primaryAction.title = state.label;
+      primaryAction.setAttribute("aria-label", state.label);
+      primaryAction.querySelector("span").textContent = state.icon;
+      return state;
     }
 
     function addMessage(role, text) {
@@ -2279,6 +2604,26 @@ function renderWebview(
       element.textContent = text;
       messages.appendChild(element);
       messages.scrollTop = messages.scrollHeight;
+      return element;
+    }
+
+    function addSteeringMessage(requestId, text, status = "queued") {
+      let element = document.querySelector(
+        '[data-steering-id="' + CSS.escape(requestId) + '"]'
+      );
+      if (!element) {
+        element = addMessage("user steering", text);
+        element.dataset.steeringId = requestId;
+      } else if (text) {
+        element.textContent = text;
+      }
+      element.classList.toggle("discarded", status === "discarded");
+      element.dataset.steeringStatus = status;
+      element.title = status === "injected"
+        ? "Steering applied at a safe model boundary"
+        : status === "discarded"
+          ? "Steering was not applied"
+          : "Steering queued for the next safe model boundary";
       return element;
     }
 
@@ -2412,6 +2757,8 @@ function renderWebview(
       for (const item of replayItems) {
         if (item.kind === "message") {
           addMessage(item.role, item.content);
+        } else if (item.kind === "steering_message") {
+          addSteeringMessage(item.steeringId, item.content, item.status);
         } else if (item.kind === "tool_call") {
           addActivity(
             item.toolCallId,
@@ -2630,39 +2977,50 @@ function renderWebview(
       agentSelect.value = agents.some((agent) => agent.id === selectedAgentId)
         ? selectedAgentId
         : "";
-      updateSendAvailability();
+      updateComposerControl();
     }
 
     function setRunning(value) {
       running = value;
-      updateSendAvailability();
+      updateComposerControl();
       clear.disabled = value;
       newChat.disabled = value;
       agentSelect.disabled = value;
       modelSelect.disabled = value;
-      cancel.style.display = value ? "block" : "none";
-      prompt.disabled = value;
       for (const button of sessionList.querySelectorAll("button")) {
         button.disabled = value;
       }
       if (!value) prompt.focus();
     }
 
+    function activatePrimaryControl() {
+      const state = updateComposerControl();
+      if (state.disabled) return;
+      const text = prompt.value.trim();
+      if (state.action === "stop") {
+        vscode.postMessage({ type: "cancel" });
+      } else if (state.action === "send") {
+        addMessage("user", text);
+        prompt.value = "";
+        updateComposerControl();
+        vscode.postMessage({ type: "send", text });
+      } else {
+        const requestId = crypto.randomUUID();
+        pendingSteering.set(requestId, text);
+        vscode.postMessage({ type: "steer", requestId, text });
+      }
+    }
     form.addEventListener("submit", (event) => {
       event.preventDefault();
-      const text = prompt.value.trim();
-      if (!text || running) return;
-      addMessage("user", text);
-      prompt.value = "";
-      vscode.postMessage({ type: "send", text });
+      activatePrimaryControl();
     });
     prompt.addEventListener("keydown", (event) => {
       if (event.key === "Enter" && !event.shiftKey) {
         event.preventDefault();
-        form.requestSubmit();
+        activatePrimaryControl();
       }
     });
-    cancel.addEventListener("click", () => vscode.postMessage({ type: "cancel" }));
+    prompt.addEventListener("input", updateComposerControl);
     clear.addEventListener("click", () => vscode.postMessage({ type: "clear" }));
     newChat.addEventListener("click", () => {
       if (!running) vscode.postMessage({ type: "newSession" });
@@ -2673,7 +3031,7 @@ function renderWebview(
       }
     });
     agentSelect.addEventListener("change", () => {
-      updateSendAvailability();
+      updateComposerControl();
       if (!running) {
         vscode.postMessage({
           type: "selectAgent",
@@ -2720,6 +3078,30 @@ function renderWebview(
           break;
         case "approvalResolved":
           resolveApproval(data.requestId, data.decision);
+          break;
+        case "steeringAccepted": {
+          const submitted = pendingSteering.get(data.requestId);
+          pendingSteering.delete(data.requestId);
+          addSteeringMessage(data.requestId, data.text, "queued");
+          if (submitted && prompt.value.trim() === submitted) {
+            prompt.value = "";
+            updateComposerControl();
+          }
+          break;
+        }
+        case "steeringInjected":
+          addSteeringMessage(data.requestId, "", "injected");
+          break;
+        case "steeringDiscarded":
+          addSteeringMessage(data.requestId, "", "discarded");
+          break;
+        case "steeringRejected":
+          pendingSteering.delete(data.requestId);
+          primaryAction.title = data.reason;
+          primaryAction.setAttribute("aria-label", data.reason);
+          break;
+        case "modelBoundary":
+          draft = null;
           break;
         case "runCompleted":
           if (!draft || draft.textContent !== data.text) addMessage("assistant", data.text);

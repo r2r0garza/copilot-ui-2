@@ -1,38 +1,42 @@
-# Deep Agents + VS Code Copilot spike
+# Bridgit Deep Agents
 
-This extension proves the integration seam between:
+This VS Code extension is a durable, project-configurable workbench that connects:
 
-- [Deep Agents for JavaScript](https://docs.langchain.com/oss/javascript/deepagents/overview), which owns planning, tool execution, subagents, context handling, and the agentic loop.
-- [VS Code's Language Model API](https://code.visualstudio.com/api/extension-guides/ai/language-model), which supplies a Copilot-backed language model.
-- A theme-aware workbench with in-memory sessions, model switching, and visible tool calls and results.
+- [Deep Agents for JavaScript](https://docs.langchain.com/oss/javascript/deepagents/overview), which owns the agentic loop, planning, tool execution, delegation, and context handling.
+- [VS Code's Language Model API](https://code.visualstudio.com/api/extension-guides/ai/language-model), which supplies Copilot-backed models and registered language-model tools.
+- A theme-aware workbench with persistent chats, project-agent selection, approval controls, tool activity, recovery, cancellation, and mid-turn steering.
 
 ## How the integration works
 
 ```mermaid
 sequenceDiagram
-    participant UI as Webview chat
+    participant UI as Workbench
     participant DA as Deep Agents
     participant Adapter as VS Code model adapter
     participant LM as vscode.lm / Copilot
-    participant FS as Workspace backend
+    participant Tools as Private and registered tools
+    participant Store as SQLite and checkpoints
 
-    UI->>DA: User message
-    DA->>Adapter: Messages + bound Deep Agents tools
-    Adapter->>LM: VS Code messages + private tool schemas
+    UI->>DA: User message and selected project agent
+    DA->>Adapter: Messages and policy-filtered tool schemas
+    Adapter->>LM: VS Code messages and private tool schemas
     LM-->>Adapter: Text and/or tool-call parts
     Adapter-->>DA: LangChain AI message with tool calls
-    DA->>FS: Execute selected built-in tool
-    FS-->>DA: Tool result
-    DA->>Adapter: Continue loop with tool result
-    Adapter->>LM: Assistant tool call + user tool result
-    LM-->>UI: Final response, streamed through the adapter
+    DA->>Tools: Execute private tool or invoke registered provider
+    Tools-->>DA: Matching tool result
+    DA->>Store: Record messages, checkpoints, approvals, and effects
+    DA->>Adapter: Continue at the next safe model boundary
+    LM-->>UI: Streamed response
 ```
 
-Deep Agents tools are passed as **private, request-local** `LanguageModelChatTool` definitions. They are not contributed through `contributes.languageModelTools`, registered with `vscode.lm.registerTool`, or invoked by VS Code. Copilot only produces the call name and arguments; Deep Agents validates and executes the call.
+Bridgit uses two tool paths while retaining one Deep Agents loop:
 
-That distinction is intentional: registering the tools with VS Code would hand invocation control to the VS Code agent/tool system, creating a second agentic loop.
+- Workspace filesystem, command, planning, and delegation tools are private, request-local definitions. Deep Agents validates and executes them.
+- Resolved MCP, web, and browser tools are adapted from the live `vscode.lm.tools` registry. Deep Agents selects them, Bridgit enforces the selected agent's policy, and the adapter calls `vscode.lm.invokeTool`.
 
-## Run the spike
+Registered providers do not grant access by themselves. A tool reaches the model only when the selected project agent allows its canonical Bridgit name, and forced calls are checked again before invocation.
+
+## Run the extension
 
 Prerequisites:
 
@@ -46,57 +50,161 @@ Then:
 1. Run `npm install`.
 2. Open this folder in VS Code.
 3. Press `F5` and choose **Run Extension** if prompted.
-4. In the Extension Development Host, select **Deep Agents** in the Activity Bar and click **Open Workbench**. The **Deep Agents: Open Chat** command remains available from the Command Palette.
-5. Choose an available Copilot model from the dropdown beside **Send**.
-6. Try a prompt such as:
+4. In the Extension Development Host, select **Deep Agents** in the Activity Bar and click **Open Workbench**. The **Deep Agents: Open Chat** command is also available from the Command Palette.
+5. Select a project agent and an available Copilot model.
+6. Enter a request and use the arrow button or press Enter. Shift+Enter inserts a newline.
 
-   > Inspect the workspace, read package.json, and create SPIKE-NOTES.md summarizing the architecture.
+The first model request or registered-provider invocation can show a VS Code consent prompt.
 
-The first model request can show VS Code's consent prompt. Opening the workbench and sending requests originate from explicit user actions, as required by the Language Model API.
+## Project customizations
 
-### Workbench sessions and models
+Bridgit discovers customizations from the first workspace folder on every run. Use **Deep Agents: Inspect Project Customizations** to see the discovered definitions and warnings.
 
-The workbench includes a session rail on the left:
+### Project agents
 
-- **New chat** creates a separate in-memory transcript and approval scope.
-- Selecting a session restores its user and final assistant messages.
-- The rename and delete controls appear on hover or on the active session.
-- After the first message, the selected Copilot model generates a 5–7 word title in the same language as that message. A manual rename takes precedence if it completes first.
-- The model dropdown applies to the next turn and can be changed at any point between turns, including mid-conversation.
+Place agents in `.github/agents/*.agent.md`. The filename without `.agent.md` is the stable agent ID. A file contains YAML frontmatter followed by the agent's instruction body:
 
-Sessions are intentionally memory-only in this spike. They are lost when the workbench panel or Extension Development Host closes; a later persistence layer can retain the same session-facing UI.
+```md
+---
+name: Coder
+description: Implements focused repository changes.
+argument-hint: Describe the requested change.
+tools: [read, search, edit, execute]
+agents: [reviewer]
+user-invocable: true
+disable-model-invocation: false
+---
 
-### Command execution
+Implement the smallest coherent change and report the verification performed.
+```
 
-The agent has a private `execute_command` tool for builds, tests, linters, and development commands. For example:
+- `name` defaults to the file ID.
+- `description` and `argument-hint` are optional display/model hints.
+- `user-invocable` defaults to `true`; `false` hides the agent from the workbench selector.
+- `disable-model-invocation` defaults to `false`; `true` prevents another agent from delegating to it.
+- `tools` controls the agent's capabilities and is fail-closed.
+- `agents` is the exact allowlist of child agent IDs available for delegation.
 
-> Run the project test suite and explain any failures.
+New chats have no implicit project agent. The chosen agent and model are stored per chat. Agent instructions are wrapped as explicit custom instructions because VS Code's model API does not support system-role messages.
 
-Commands are represented as an executable plus an argument array and run with the first workspace folder as their fixed working directory. The runner:
+### Tool policy
 
-- Uses `shell: false`; pipes, redirects, variable expansion, and `&&` are not implicitly interpreted.
-- Passes an environment allowlist instead of the Extension Host's full environment.
-- Rejects the executable or any argument containing `..` before a process is spawned.
-- Rejects `~`, `$HOME`, `$PWD`, related home-directory expansion tokens, and absolute argument paths outside the workspace.
-- Preflights these path rules before showing the approval card. Invalid requests are rejected back to the agent so it can retry with `.` or a workspace-contained path.
-- Defaults to a 60-second timeout, with a hard schema limit of 120 seconds.
-- Captures up to 100 KB of combined stdout and stderr.
-- Requires explicit approval unless command execution has been allowed for the current chat session.
-- Offers **Allow once**, **Allow for session**, and **Deny for now**.
-- Shows a concise action label such as **Read package.json**, **Listed workspace files**, or **Ran npm test**.
-- Keeps completed tool activity collapsed by default; expand a row to inspect its inputs, stdout, stderr, or other result details.
+`tools` is fail-closed:
 
-The approval boundary remains essential. These argument checks prevent direct traversal and expansion attempts, but they are not an operating-system sandbox: an explicitly approved interpreter such as `sh`, `node`, or `python` can still access host paths internally. Strong workspace confinement will require a sandbox backend.
+- An omitted `tools` field or `tools: []` exposes no tools.
+- `tools: ["*"]` exposes all tools that Bridgit can resolve for that run.
+- Built-in aliases are `read`, `search`, `edit`/`write`, `execute`/`shell`/`bash`/`powershell`, `agent`, and `todo`/`todos`.
+- Exact built-in names such as `read_file` and `execute_command` are also accepted.
+- `web` resolves to `web/fetch`; `browser` or `browser/*` resolves the browser family.
+- MCP tools use `<server>/<tool>` or `<server>/*`, for example `playwright/browser_click`.
+- `vscode` and `vscode/*` are intentionally ignored; there is no general VS Code command bridge.
+- Unknown capabilities and MCP servers produce diagnostics and grant nothing.
 
-### File-change approvals
+The prompt for every model call states which tools are actually exposed. If a requested operation is impossible, the agent is instructed to identify the missing capability and the relevant `tools` change instead of pretending it succeeded.
 
-`write_file` and `edit_file` pause before changing the workspace. The chat displays the proposed tool arguments and offers:
+### Project skills
 
-- **Allow once** — approve the currently displayed operation batch. A later write or edit asks again.
-- **Allow for session** — approve the current batch and automatically allow that tool for the lifetime of the active chat session.
-- **Deny for now** — reject the current batch and return that denial to the agent so it can adjust its response.
+Place skills in `.github/skills/<directory>/SKILL.md`. Each skill requires non-empty `name` and `description` frontmatter plus an instruction body:
 
-Each chat has its own in-memory approval scope. Switching chats does not transfer allowances; deleting a chat or closing the workbench clears its allowances. Clearing a conversation retains its chat-level allowances.
+```md
+---
+name: code-review
+description: Review a selected change for correctness and test coverage.
+---
+
+Inspect the requested change and recommend focused verification.
+```
+
+Valid skills are included in the selected agent's runtime guidance and refresh for existing checkpointed chats. Skills provide instructions only: they never expand the agent's tool policy or authorize side effects.
+
+### MCP servers
+
+Bridgit reads both `.github/mcp.json` and `.vscode/mcp.json`. A duplicate server in `.vscode/mcp.json` overrides the `.github` definition. Source-specific `transport` and `type` spellings are normalized during discovery.
+
+Configured servers are matched to currently registered VS Code language-model tools at runtime. Invalid, unsupported, unavailable, ambiguous, or untrusted providers are skipped with diagnostics; other valid servers remain usable. Start and trust the MCP server in VS Code, refresh its cached tools if needed, and inspect project customizations again.
+
+Canonical policy names use `<configured-server>/<provider-tool>`. Provider names that do not satisfy the model's tool-name grammar are exposed under a safe alias and translated back before authorization and invocation.
+
+## Runtime capabilities
+
+### Workspace files and commands
+
+Workspace file tools use Deep Agents' `FilesystemBackend` in virtual mode: `/` maps to the first workspace folder, and direct traversal outside it is rejected. `write_file` and `edit_file` require approval unless that tool has been allowed for the current chat during the current Extension Host process.
+
+`execute_command` runs an executable plus an argument array from the first workspace folder:
+
+- It uses `shell: false`; pipes, redirects, variable expansion, and `&&` are not interpreted.
+- It receives an environment allowlist rather than the Extension Host's full environment.
+- It rejects `..`, home expansion tokens, and absolute argument paths outside the workspace before approval.
+- It defaults to a 60-second timeout with a 120-second schema maximum.
+- It captures up to 100 KB of combined stdout and stderr.
+- It requires approval unless command execution is allowed for the current chat and process.
+
+Approvals offer **Allow once**, **Allow for session**, and **Deny for now** where session allowance is supported. Session allowances are isolated by chat but intentionally process-local: closing the Extension Development Host expires their authority. Persisted approval outcomes are audit history, not reusable authorization. Deleting a chat removes its allowance; clearing its conversation keeps the chat-level allowance until the process exits.
+
+These checks are guardrails, not an operating-system sandbox. An approved interpreter can still access host paths internally, and completed side effects are not rolled back.
+
+### Web and browser
+
+Web retrieval and browser interaction are separate capabilities:
+
+- `web/fetch` retrieves content from explicit URLs through the registered `copilot_fetchWebPage` provider. It is not general web search and does not open an interactive browser.
+- `browser/*` adapts the integrated browser family for opening, reading, navigating, clicking, typing, hovering, dragging, dialogs, screenshots, and focused Playwright code.
+
+The browser family resolves only when its complete provider contract is present and schema-compatible. State-changing or data-disclosing actions such as click, type, drag, dialog handling, and arbitrary browser code require host approval. Browser page IDs and live page state are provider-managed and are not durably persisted by Bridgit.
+
+### Project-agent delegation
+
+An agent receives Deep Agents' `task` tool only when its `tools` includes `agent` (or otherwise allows `task`) and its `agents` allowlist resolves usable children. Omitting `agents` conservatively exposes no children.
+
+Delegated children:
+
+- Receive their own Markdown instructions, tool policy, and applicable project skills.
+- Never inherit broader tools from the parent.
+- May be hidden from the user selector with `user-invocable: false`.
+- Are excluded when `disable-model-invocation: true`.
+- Are resolved by stable file ID, not display name.
+
+Delegation is limited to one level. Unknown children, disabled children, direct or indirect cycles, and attempts to delegate beyond that depth produce explicit diagnostics or tool errors.
+
+### Stop and steering
+
+The composer changes behavior with runtime state:
+
+| Runtime state | Textbox | Primary action |
+|---|---|---|
+| Idle | Empty | Send arrow, disabled |
+| Idle | Has text | Send a new turn |
+| Running | Empty | Stop the active run |
+| Running | Has text | Queue a steering message |
+
+Stop uses the active run's cancellation path, safely denies a pending approval, records cancellation, and returns the composer to idle. It does not undo completed side effects.
+
+Steering messages use FIFO order and enter at the next safe model boundary, after any outstanding tool result is recorded and before the next model call. They are never inserted between an assistant tool call and its matching tool result. Steering augments the active run; it does not cancel it or discard completed work.
+
+## Persistence and recovery
+
+Chats, titles, selected models and agents, conversation events, tool traces, approval outcomes, runs, and recovery state are stored per workspace in SQLite. LangGraph checkpoints use the same durable store. Switching chats or reloading the Extension Host restores the workbench history.
+
+An interrupted run is classified on startup:
+
+- Runs waiting for approval can be reviewed and resumed from their saved checkpoint.
+- Runs with uncertain side effects require an explicit reconciliation decision.
+- Completed and cancelled activity remains visible as audit history.
+
+Recovery never treats a historical **Allow for session** decision as current authority.
+
+## Diagnostics
+
+The Command Palette exposes:
+
+- **Deep Agents: Inspect Project Customizations** — discovered agents, skills, MCP configuration sources, resolved runtime tools, and configuration diagnostics.
+- **Deep Agents: Inspect Registered Tools** — detailed provider research metadata. Treat this output as sensitive when sharing it.
+- **Deep Agents: Inspect Runtime Diagnostics** — a safe, structured snapshot of model/tool registration metadata, schema shapes, canonical mappings, and diagnostic codes. It explicitly excludes model prompts, tool inputs, tool results, and MCP launch configuration.
+
+Repeated identical failures are bounded per run by tool name, canonical arguments, and normalized error. After the third identical failure, Bridgit returns terminal guidance and removes tools from the next model call; a hard fallback prevents a provider from forcing an endless cycle.
+
+The **Deep Agents Model Calls** output channel currently records complete system and user prompts and opens automatically. It can contain proprietary instructions, user content, and tool context. Treat it as sensitive. The settings phase owns replacing this temporary behavior with an explicit persisted opt-in, along with the default-agent and Deep Agents base-prompt settings.
 
 ## Development
 
@@ -108,22 +216,12 @@ npm test
 
 The extension is bundled to `dist/extension.js`; `vscode` remains external and is supplied by the Extension Host.
 
-## Current spike boundaries
+## Current boundaries
 
-- Workspace access uses Deep Agents' `FilesystemBackend` in virtual mode. `/` maps to the first workspace folder, and traversal outside it is rejected.
-- The built-in filesystem/planning/subagent tools are enabled.
-- Host process execution is available only through the custom `execute_command` tool. Deep Agents' unrestricted `LocalShellBackend` is not enabled.
-- `write_file` and `edit_file` use Deep Agents human-in-the-loop interrupts backed by the shared SQLite LangGraph checkpointer. Startup recovery classifies stale runs and displays recovery state in the originating chat; automatic continuation is intentionally disabled.
-- `execute_command` uses the same interrupt mechanism and can be allowed for the active chat session. This allowance covers the tool as a whole, not a particular executable or argument signature.
-- VS Code does not support system-role messages in this API, so the adapter encodes LangChain system messages as clearly delimited user-role instructions.
-- Conversation sessions, model choices, messages, tool traces, and approval outcomes are persisted per workspace and restored after switching sessions or reloading the Extension Host.
-- The UI renders plain text rather than Markdown.
-- Multi-root workspaces currently use the first folder.
-
-## Useful next experiments
-
-1. Integrate every tool execution with the durable side-effect ledger and explicit continuation controls.
-2. Add per-path approval policies and a visible way to revoke session allowances.
-3. Replace whole-tool command session approval with narrowly scoped policies, such as an exact `npm test` signature.
-4. Add a workbench tool for diagnostics or active-editor context.
-5. Test model-family behavior across the Copilot models returned by `vscode.lm.selectChatModels`.
+- The workbench renders plain text rather than Markdown.
+- Multi-root workspaces use the first folder.
+- Session approval grants are per-tool rather than scoped to an exact command or path.
+- `web/fetch` requires an explicit URL; there is no deterministic general-search bridge.
+- Browser state is owned by its registered provider and does not survive as Bridgit session state.
+- Full-prompt logging, default-agent selection, and the Deep Agents base-prompt toggle await the settings phase.
+- Workspace path validation is not an operating-system sandbox.

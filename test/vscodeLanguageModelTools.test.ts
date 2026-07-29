@@ -104,7 +104,9 @@ async function main(): Promise<void> {
     invokeRegisteredLanguageModelTool("missing_tool", {}),
     (error) =>
       error instanceof LanguageModelToolInvocationError &&
-      error.code === "unavailable",
+      error.code === "unavailable" &&
+      /not invoked/.test(error.message) &&
+      /Do not retry unchanged/.test(error.message),
   );
 
   vscode.lm.invokeTool = async () => {
@@ -116,7 +118,9 @@ async function main(): Promise<void> {
     invokeRegisteredLanguageModelTool("fixture_readOnly", {}),
     (error) =>
       error instanceof LanguageModelToolInvocationError &&
-      error.code === "permission-denied",
+      error.code === "permission-denied" &&
+      /not authorized to complete/.test(error.message) &&
+      /user grants permission/.test(error.message),
   );
 
   const controller = new AbortController();
@@ -147,7 +151,8 @@ async function main(): Promise<void> {
     invokeRegisteredLanguageModelTool("fixture_readOnly", {}),
     (error) =>
       error instanceof LanguageModelToolInvocationError &&
-      error.code === "unavailable",
+      error.code === "unavailable" &&
+      /registered tools are refreshed/.test(error.message),
   );
 
   console.log(

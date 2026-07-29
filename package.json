@@ -44,6 +44,10 @@
       {
         "command": "deepagentsSpike.inspectRegisteredTools",
         "title": "Deep Agents: Inspect Registered Tools"
+      },
+      {
+        "command": "deepagentsSpike.inspectRuntimeDiagnostics",
+        "title": "Deep Agents: Inspect Runtime Diagnostics"
       }
     ],
     "configuration": {

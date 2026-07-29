@@ -167,12 +167,19 @@ export function createAgentToolPolicyMiddleware(
   return createMiddleware({
     name: "AgentToolPolicy",
     wrapModelCall(request, handler) {
+      const tools = request.tools?.filter(
+        (tool) =>
+          !hasToolName(tool) ||
+          policy.allows(canonicalName(tool.name)),
+      );
+      const visibleToolNames = (tools ?? [])
+        .filter(hasToolName)
+        .map((tool) => canonicalName(tool.name));
       return handler({
         ...request,
-        tools: request.tools?.filter(
-          (tool) =>
-            !hasToolName(tool) ||
-            policy.allows(canonicalName(tool.name)),
+        tools,
+        systemMessage: request.systemMessage.concat(
+          renderAgentToolCapabilityPrompt(policy, visibleToolNames),
         ),
       });
     },
@@ -182,13 +189,68 @@ export function createAgentToolPolicyMiddleware(
       }
       const policyToolName = canonicalName(request.toolCall.name);
       return new ToolMessage({
-        content: `Tool "${policyToolName}" is not allowed by this agent's tools policy.`,
+        content: renderAgentToolPolicyBlock(policyToolName, policy),
         tool_call_id: request.toolCall.id ?? "missing-tool-call-id",
         name: policyToolName,
         status: "error",
       });
     },
   });
+}
+
+export function renderAgentToolCapabilityPrompt(
+  policy: AgentToolPolicy,
+  visibleToolNames: readonly string[],
+): string {
+  const visible = [...new Set(visibleToolNames)].sort();
+  const unavailable = configuredCapabilitiesNotVisible(policy, visible);
+  return [
+    "## Runtime Tool Capabilities",
+    `Tools exposed for this model call: ${visible.length > 0 ? visible.join(", ") : "none"}.`,
+    "This model-call inventory is authoritative. Do not call, invent, or retry tools that are absent from it.",
+    ...(unavailable.length > 0
+      ? [
+          `Configured capabilities currently unavailable: ${unavailable.join(", ")}.`,
+          "They require a provider/configuration state change before an unchanged retry can succeed.",
+        ]
+      : []),
+    visible.length > 0
+      ? "If the available tools cannot complete the request, explain the missing capability clearly and suggest selecting an appropriately configured agent or changing the project agent configuration."
+      : "Answer without tools. If the request requires workspace or external actions, explain that the selected agent has no usable tools and suggest selecting an appropriately configured agent.",
+  ].join("\n");
+}
+
+export function renderAgentToolPolicyBlock(
+  toolName: string,
+  policy: AgentToolPolicy,
+): string {
+  const allowed =
+    policy.resolvedTools.length > 0
+      ? policy.resolvedTools.join(", ")
+      : "none";
+  return [
+    `Tool "${toolName}" is not allowed by this agent's tools policy and was not executed.`,
+    `Configured capabilities for this agent: ${allowed}.`,
+    "Do not retry this tool, an alias, or an equivalent invocation in the current run.",
+    "Use only tools exposed in the next model request. If they cannot fulfill the task, explain the missing capability and suggest selecting another agent or updating this agent's .agent.md tools list.",
+  ].join("\n");
+}
+
+function configuredCapabilitiesNotVisible(
+  policy: AgentToolPolicy,
+  visibleToolNames: readonly string[],
+): string[] {
+  if (policy.mode !== "explicit") {
+    return [];
+  }
+  const visible = new Set(visibleToolNames);
+  return policy.resolvedTools.filter((capability) =>
+    capability.endsWith("*")
+      ? !visibleToolNames.some((toolName) =>
+          toolName.startsWith(capability.slice(0, -1)),
+        )
+      : !visible.has(capability),
+  );
 }
 
 function createPolicy(

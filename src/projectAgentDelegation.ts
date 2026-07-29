@@ -60,7 +60,12 @@ export function createProjectAgentDelegationGuardMiddleware(
         [...allowed.values()].map((agentId) => `"${agentId}"`).join(", ") ||
         "none";
       return new ToolMessage({
-        content: `Project agent "${requestedAgent || "<missing>"}" is not available for delegation. Allowed project agents: ${allowedDescription}.`,
+        content: [
+          `Project agent "${requestedAgent || "<missing>"}" is not available for delegation and was not invoked.`,
+          `Allowed project agents: ${allowedDescription}.`,
+          "Do not retry the unavailable child or a different spelling of its name in this run.",
+          "Choose an allowed child only when it fits the task; otherwise continue with the current agent's tools or explain the delegation limitation.",
+        ].join("\n"),
         tool_call_id: request.toolCall.id ?? "missing-tool-call-id",
         name: "task",
         status: "error",

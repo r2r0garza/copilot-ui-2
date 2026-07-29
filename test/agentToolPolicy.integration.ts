@@ -71,8 +71,18 @@ async function main(): Promise<void> {
     ["ls", "read_file"],
     "Only the resolved read tools should be visible to the model.",
   );
+  assert.match(
+    JSON.stringify(requests[0]?.messages ?? []),
+    /Tools exposed for this model call: ls, read_file/,
+  );
+  assert.match(
+    JSON.stringify(requests[0]?.messages ?? []),
+    /Do not call, invent, or retry tools that are absent/,
+  );
   const secondRequestText = JSON.stringify(requests[1]?.messages ?? []);
   assert.match(secondRequestText, /not allowed by this agent's tools policy/);
+  assert.match(secondRequestText, /was not executed/);
+  assert.match(secondRequestText, /Do not retry/);
   await assert.rejects(readFile(deniedPath, "utf8"), { code: "ENOENT" });
 
   const noToolsRequests: vscode.LanguageModelChatRequestOptions[] = [];

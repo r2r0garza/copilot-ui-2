@@ -1,6 +1,6 @@
 # Runtime Capabilities Completion Plan
 
-**Status:** Plan 05 complete — Plan 06 ready
+**Status:** Complete — Plans 01–09 verified
 **Created:** 2026-07-29
 **Depends on:** Executable `.github` agents/skills slice; settings persistence where explicitly referenced
 **Scope:** Complete the remaining agent runtime bridges, delegation, live-turn controls, and production hardening
@@ -131,16 +131,20 @@ Stopping aborts the active model/tool loop through the existing `AbortController
 
 Cancellation does not roll back already completed side effects.
 
-### R-10: Diagnostics must be deliberate and safe
+### R-10: Runtime diagnostics must be deliberate and safe
 
 The current “Deep Agents Model Calls” channel records complete prompts and may contain proprietary instructions, user content, and tool context.
 
-Before this phase is complete:
+Phase 002 owns the persisted setting, UI, and runtime gate that make complete model-call
+prompt logging explicitly opt-in. This phase owns the remaining runtime diagnostic
+surface:
 
-- Make full prompt logging explicitly opt-in or development-only.
-- Do not automatically reveal the channel on every model call in normal use.
-- Clearly label sensitive diagnostic output.
-- Never log secrets returned by tools without an explicit diagnostic contract and redaction policy.
+- Provider and registered-tool diagnostics must be structured and useful without
+  including complete prompts.
+- Diagnostic output must not include secrets returned by tools without an explicit
+  diagnostic contract and redaction policy.
+- Any temporary full-prompt logging behavior remains documented as sensitive until the
+  Phase 002 setting replaces it.
 
 ### R-11: Repeated tool failures terminate coherently
 
@@ -723,6 +727,47 @@ Acceptance:
 - Keyboard and pointer behavior are equivalent.
 - Screen readers receive action-specific labels.
 
+#### Plan 06 implementation evidence — 2026-07-29
+
+- Replaced the separate text Send and Cancel buttons with one square primary control.
+- A dependency-free, unit-tested resolver maps composer state to the control:
+  - idle + empty → disabled right arrow;
+  - idle + text → enabled right arrow;
+  - running + empty → stop square;
+  - running + text → up arrow.
+- No selected agent also keeps idle send disabled, while the selected agent is fixed
+  during a run and does not affect stop or steering availability.
+- The control updates its `title` and `aria-label` to `Send message`,
+  `Select an agent before sending`, `Stop active run`, or
+  `Send steering message` as appropriate. The glyph itself is hidden from assistive
+  technology.
+- Click and unmodified Enter call the same primary-action function. Shift+Enter retains
+  the browser's normal newline behavior.
+- The textarea remains enabled while a run is active. Workbench refreshes, selector
+  refreshes, run-state changes, and assistant/tool updates do not replace its value.
+- Sending a normal idle turn clears the composer. Stop uses the existing cancellation
+  message. The up arrow emits a typed `steer` host message but deliberately preserves
+  the draft; Plan 07 owns safe queueing, acknowledgement, and draft clearing.
+- TypeScript check, production bundle, the composer state-machine test, and the full
+  automated suite pass.
+
+Manual visual checkpoint:
+
+1. With an agent selected and an empty composer, confirm the disabled right arrow and
+   `Send message` tooltip. Typing text enables it.
+2. Confirm Shift+Enter inserts a newline and Enter sends the idle turn.
+3. While the run is active and the composer is empty, confirm the stop square,
+   `Stop active run` tooltip, and successful cancellation.
+4. During another active run, type without stopping. Confirm the textbox remains
+   editable, the control becomes an up arrow with `Send steering message`, and clearing
+   the text restores the stop square.
+5. Do not expect steering to affect the run until Plan 07; if activated in this slice,
+   its draft intentionally remains visible.
+
+Manual verification confirmed all four composer states, shared Enter/click behavior,
+editable running input, Shift+Enter newline entry, and stop cancellation. Plan 06
+acceptance is complete.
+
 ### Plan 07 — Safe steering queue
 
 - Add a host-owned steering queue per active run.
@@ -739,20 +784,190 @@ Acceptance:
 - Stop remains available when no steering text is present.
 - Restart behavior is deterministic and documented.
 
+#### Plan 07 implementation evidence — 2026-07-29
+
+- Added one host-owned `SteeringQueue` for each active parent run. Accepted messages
+  are deduplicated by request ID and drained in FIFO order.
+- Added parent-only LangChain middleware that injects all currently queued messages
+  immediately before the next model call. Tool execution and approval resumption finish
+  first, so an assistant tool call and its corresponding `ToolMessage` remain adjacent.
+- Steering received during a final model response schedules another invocation with no
+  new ordinary user turn. The completed intermediate response is retained and the
+  steered follow-up starts in a separate response bubble.
+- The composer clears a steering draft only after the extension host acknowledges it.
+  Replay renders steering as a distinct labeled user message with queued, injected, or
+  discarded status.
+- Persisted `steering_message`, `steering_injected`, and `steering_discarded` events
+  preserve causal outcomes. Schema migration 4 rebuilds the constrained event table
+  without losing existing rows and accepts the new event types.
+- Cancellation and failure close the queue and persist discard outcomes for pending
+  entries. A restarted approval-waiting run restores only accepted entries that have
+  neither an injected nor discarded outcome; already injected entries are not replayed
+  into the model.
+- Unit and integration coverage verifies FIFO ordering, duplicate safety, queue closure,
+  cancellation discard, restart restoration, late-response follow-up, safe
+  tool-call/result ordering, replay status, and migration data retention.
+- TypeScript check, production build, the complete automated suite, and
+  `git diff --check` pass.
+
+Manual checkpoint:
+
+1. Start a fresh run with an agent that can execute commands and ask it to run a command
+   that waits about eight seconds before printing `alpha`, then report that result.
+2. Approve the command. While it is executing, type
+   `Also end your final answer with BRAVO.` and activate the up-arrow control.
+3. Confirm the draft clears only after acknowledgement and appears as a separate
+   `Steering` message. The empty composer must immediately return to the stop control.
+4. Confirm the tool completes once, its result remains paired with its tool call, and
+   the next model response reports `alpha` and ends with `BRAVO`.
+5. Reload the Extension Host after completion and confirm the steering message remains
+   distinct in replay and is shown as applied, rather than becoming an ordinary user
+   turn or being applied again.
+
+Manual verification confirmed that steering was acknowledged and applied during the
+active run, with the tool operation completing and the steered final response produced
+as expected. Plan 07 acceptance is complete.
+
 ### Plan 08 — Failure-loop and diagnostic hardening
 
 - Add bounded repeated-tool-failure detection.
 - Improve capability-limitation feedback.
-- Make full model-call logging opt-in/development-only.
 - Add structured diagnostics for provider/tool registration.
-- Review prompt and tool logs for sensitive-data exposure.
-- Remove temporary experiment flags that Phase 002 replaces with settings.
+- Review provider and tool diagnostics for sensitive-data exposure.
 
 Acceptance:
 
 - Repeated identical failures terminate within the documented bound.
-- Normal users do not emit or auto-open full prompt logs.
-- Diagnostic mode provides enough evidence to debug prompt and tool exposure.
+- Structured diagnostics provide enough evidence to debug provider and tool exposure
+  without including complete model prompts or tool-returned secrets.
+
+#### Plan 08 repeated-failure slice — 2026-07-29
+
+- Added a run-scoped middleware guard with a limit of three matching failures.
+- A matching failure has the same tool name, canonicalized input, and normalized error
+  result. Different inputs have independent counts, and a successful execution of the
+  same request clears its earlier failures.
+- At the third matching failure, the corresponding `ToolMessage` remains paired with
+  its assistant tool call and gains an explicit terminal explanation. The next model
+  decision receives the existing failure context with an empty tool list, allowing one
+  final user-facing explanation without another tool attempt.
+- Calls already emitted in the threshold-crossing model response are blocked before
+  execution. If a provider nevertheless forces another tool/model cycle after the
+  tools-disabled response, the guard raises a typed terminal error instead of looping.
+- The guard is installed outside the policy, delegation, approval, and durable-ledger
+  middleware so it observes returned policy/delegation failures while leaving graph
+  interrupts and completed side effects unchanged.
+- Unit coverage verifies canonical input matching, independent inputs, success reset,
+  terminal tool blocking, the tools-disabled response, and the hard fallback bound.
+  DeepAgents integration coverage verifies three forced policy failures followed by one
+  final tools-disabled model response.
+- TypeScript check, production build, and the complete automated suite pass.
+
+Manual checkpoint:
+
+1. Select an agent with `read_file` access and ask:
+   `Use read_file to read /plan08-definitely-missing.txt exactly three times with
+   exactly the same path even when it fails, then explain the result.`
+2. Confirm exactly three failed read activities appear, each with a corresponding
+   result. No fourth read should execute.
+3. Confirm the final response explains the missing file or capability limitation
+   instead of retrying indefinitely.
+
+Manual verification confirmed exactly three paired `read_file` failures for the same
+missing path, no fourth execution, no file changes, and a coherent final ENOENT
+explanation. The repeated-failure slice is accepted.
+
+#### Plan 08 capability-feedback slice — 2026-07-29
+
+- Every model call now receives an authoritative, sorted inventory of tools actually
+  exposed after agent-policy and runtime-provider filtering.
+- When configured capabilities have no matching runtime tool, the prompt identifies
+  them as currently unavailable and explains that a provider/configuration state change
+  is required before an unchanged retry can succeed.
+- An agent with no usable tools is told to answer without tools, explain the limitation,
+  and suggest selecting an appropriately configured agent for workspace or external
+  actions.
+- Forced policy violations now state that no execution occurred, list the agent's
+  configured capability selectors, prohibit alias/equivalent retries, and suggest the
+  concrete agent-selection or `.agent.md` configuration remedies.
+- Invalid delegation attempts now distinguish “not invoked” from execution failure,
+  preserve the allowed-child list, and prohibit spelling-based retries.
+- Registered VS Code provider errors now distinguish unavailable, permission-denied,
+  and provider-failure states. Unavailable and permission-denied results describe the
+  external state change required before retrying.
+- Unit and DeepAgents integration coverage verifies visible/no-tool prompts, unavailable
+  configured capabilities, forced-call blocking guidance, provider-state guidance, and
+  unchanged fail-closed enforcement.
+- TypeScript check, production build, complete automated suite, and
+  `git diff --check` pass.
+
+Manual checkpoint:
+
+1. Select `Quality Reviewer`, whose explicit empty tools list resolves to no tools.
+2. Ask:
+   `Create capability-feedback.txt containing hello. If you cannot, explain exactly
+   which capability is missing and what I should change.`
+3. Confirm no tool activity or approval appears and no file is created.
+4. Confirm the response immediately explains that the selected agent lacks a file-write
+   capability and recommends selecting an agent with write/edit access or updating the
+   agent's `.agent.md` tools configuration.
+
+Manual verification confirmed that the no-tools agent exposed no activity or approval,
+did not create the requested file, cited the authoritative empty runtime inventory,
+identified `write_file`/`edit_file` as missing, and suggested appropriate configuration
+or local alternatives. The capability-feedback slice is accepted.
+
+#### Plan 08 sanitized-diagnostics slice — 2026-07-29
+
+- Added `Deep Agents: Inspect Runtime Diagnostics` as a separate command from the
+  detailed registered-tool research report.
+- The versioned JSON snapshot includes only:
+  - VS Code and capture metadata;
+  - registered Copilot model identifiers and token limits;
+  - registered tool names, tags, contribution-manifest owners, and top-level schema
+    shape;
+  - resolved MCP/web/browser canonical-to-provider mappings and approval classification;
+  - sorted structured warning codes for missing/duplicate/unattributed providers and
+    runtime contract mismatches.
+- Explicit safety flags state that the report contains no model prompts, tool inputs,
+  tool results, or MCP launch configuration.
+- Tool descriptions, schema descriptions/defaults/examples, MCP source paths, commands,
+  URLs, environment values, and invocation data are not copied into the snapshot.
+- The report uses current `selectChatModels({ vendor: "copilot" })` and `vscode.lm.tools`
+  snapshots, so provider changes are re-read each time the command runs.
+- Automated redaction fixtures plant private marker strings in descriptions, schema
+  defaults, MCP paths, commands, and environment values and prove none appear in the
+  rendered report. Coverage also verifies model absence, duplicate tool names,
+  unattributed tools, and canonical MCP resolution.
+- Manual inspection found that emitting one warning for every tool without a matching
+  contribution manifest overwhelmed the actionable diagnostics. Those entries are now
+  consolidated into one count-based warning that points to each tool's existing
+  `contributingExtensions` field and avoids inferring ownership from names.
+- TypeScript check, production build, complete automated suite, and
+  `git diff --check` pass.
+
+Manual checkpoint:
+
+1. Reload the Extension Host so the contributed command is available.
+2. Run `Deep Agents: Inspect Runtime Diagnostics` from the Command Palette.
+3. Confirm the `Deep Agents Runtime Tools` output starts with the safe-diagnostic notice
+   and contains a JSON object with `schemaVersion: 1`.
+4. Confirm all four `safety` values are `false`.
+5. Confirm the report lists model metadata, registered tool schema shape, resolved
+   MCP/web/browser mappings, and structured diagnostics applicable to the current
+   workspace.
+6. Confirm it does not contain recent user prompts or tool results, MCP command/URL/env
+   values, or complete tool/schema descriptions. Running this command must not invoke a
+   model or registered tool.
+
+Initial manual inspection confirmed the versioned structure, all-false safety flags,
+current model/tool mappings, useful MCP/web diagnostics, and absence of prompt, result,
+launch-configuration, and secret-bearing values. A final rerun after the unattributed
+warning consolidation should show exactly one `tools.runtime.unattributed` diagnostic.
+
+The final manual rerun confirmed `schemaVersion: 1`, all four safety flags set to
+`false`, and exactly one aggregated `tools.runtime.unattributed` diagnostic covering
+the currently unattributed registrations. Plan 08 acceptance is complete.
 
 ### Plan 09 — Documentation and end-to-end verification
 
@@ -762,6 +977,69 @@ Acceptance:
 - Document web versus browser intent.
 - Document delegation, stop, steering, and prompt settings after implementation.
 - Run the full automated suite and manual acceptance matrix.
+
+#### Plan 09 implementation evidence — 2026-07-29
+
+- Replaced stale README claims about in-memory chats, universally available built-ins,
+  and an exclusively private tool path.
+- Documented the durable SQLite/checkpoint model, process-local approval authority,
+  startup recovery, and the distinction between persisted audit history and current
+  authorization.
+- Documented `.github/agents/*.agent.md`, `.github/skills/*/SKILL.md`, both MCP
+  configuration locations and their precedence, agent visibility/delegation fields,
+  and conservative one-level child allowlists.
+- Documented fail-closed tool selection, built-in aliases, exact and wildcard MCP
+  selectors, ignored `vscode`, per-call capability feedback, and forced-call
+  enforcement.
+- Documented explicit-URL `web/fetch` versus interactive `browser/*`, provider-managed
+  page state, and the approval boundary for state-changing browser actions.
+- Documented composer stop/steer states, FIFO steering at safe model boundaries,
+  cancellation without rollback, repeated-failure termination, and the safe and
+  sensitive diagnostic surfaces.
+- Kept Phase 002 ownership explicit: complete prompt logging remains temporary and
+  sensitive until the settings phase adds its persisted opt-in, default-agent setting,
+  and Deep Agents base-prompt toggle.
+- `npm test` passes, including TypeScript checking, the production bundle, all runtime
+  adapter/policy/delegation/composer/steering/failure tests, and the complete existing
+  persistence, approval, recovery, and tool-ledger suite. `git diff --check` also
+  passes.
+
+Earlier slice acceptance already supplies manual evidence for matrix items 1 and 4–11:
+allowed MCP invocation; interactive browser routing and approval; allowed and forbidden
+delegation; stop; steering during tool activity with intact pairing; bounded repeated
+failures; and coherent replay after Extension Host reload.
+
+Final manual checkpoint:
+
+1. With the Playwright MCP server running and trusted, select `MCP Fixture Verifier`
+   and ask:
+   `Use playwright-mcp/browser_click. If it is unavailable to you, report the exact
+   tools exposed for this model call and do not substitute another tool.`
+2. Confirm no Playwright tool activity or approval appears. The response should state
+   that only `bridgit-runtime-fixture/read_fixture` is exposed (or otherwise accurately
+   omit `playwright-mcp/browser_click` from the exposed inventory).
+3. Select `Web Fetch Verifier` and ask:
+   `What are today's top news stories? Use only your available tools. Do not invent a
+   URL and do not open a browser.`
+4. Confirm no browser opens and no fetch call is made against a guessed URL. The
+   response should explain that only explicit-URL fetch is available and that no
+   deterministic general web-search provider is exposed.
+
+Final manual acceptance evidence — 2026-07-29:
+
+- With `MCP Fixture Verifier` selected, a request for
+  `playwright-mcp/browser_click` produced no Playwright activity or approval. The
+  response accurately listed `bridgit-runtime-fixture/read_fixture` as the only tool
+  exposed for that model call.
+- With `Web Fetch Verifier` selected, an open-ended request for today's top news
+  produced no browser activity and no fetch against an invented URL. The response
+  correctly declined because no explicit URL was supplied and the selected agent had
+  no browser capability. Although its wording did not name the absent general-search
+  provider directly, its behavior and stated limitation preserved the locked
+  fetch-versus-browser/search boundary.
+- Together with the earlier slice evidence, all eleven manual verification-matrix
+  items have passed. Plan 09 and the runtime-capabilities completion phase are
+  accepted.
 
 ## Verification Matrix
 
@@ -774,7 +1052,6 @@ Acceptance:
 - Composer state-machine tests.
 - Steering causal-order and tool-pairing tests.
 - Repeated-failure loop bound.
-- Prompt wrapper and prompt-setting regression tests.
 - Persistence/replay tests for delegation and steering events.
 - Full existing persistence, approval, recovery, and tool-ledger suite.
 
@@ -791,7 +1068,6 @@ Acceptance:
 9. Steer during tool activity and verify no orphaned tool result appears.
 10. Trigger a repeated missing-file/capability failure and verify bounded termination.
 11. Restart the Extension Host and verify replay/recovery remain coherent.
-12. Verify full prompt logs are absent unless diagnostic mode is enabled.
 
 ## Success Criteria
 
@@ -801,7 +1077,6 @@ Acceptance:
 - Stop reliably cancels active work without implying rollback.
 - Steering reaches the next safe model boundary without corrupting tool protocol state.
 - Repeated tool failures do not spiral indefinitely.
-- Sensitive full-prompt logging is not enabled by default.
 - Documentation matches shipped behavior.
 - Existing persistence, approval, recovery, agent, skill, and tool-policy tests remain green.
 

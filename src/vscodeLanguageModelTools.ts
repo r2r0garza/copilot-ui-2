@@ -150,7 +150,11 @@ export async function invokeRegisteredLanguageModelTool(
   if (!vscode.lm.tools.some((tool) => tool.name === providerName)) {
     throw new LanguageModelToolInvocationError(
       "unavailable",
-      `Registered language-model tool "${providerName}" is unavailable.`,
+      [
+        `Registered language-model tool "${providerName}" is unavailable and was not invoked.`,
+        "The provider may be stopped, disabled, untrusted, or absent from VS Code's current registered-tool cache.",
+        "Do not retry unchanged in this run; start/trust the provider or refresh its registered tools first.",
+      ].join(" "),
     );
   }
   if (signal?.aborted) {
@@ -190,14 +194,20 @@ export async function invokeRegisteredLanguageModelTool(
     if (!vscode.lm.tools.some((tool) => tool.name === providerName)) {
       throw new LanguageModelToolInvocationError(
         "unavailable",
-        `Registered language-model tool "${providerName}" became unavailable during invocation.`,
+        [
+          `Registered language-model tool "${providerName}" became unavailable during invocation.`,
+          "Do not retry unchanged until the provider is started/trusted and its registered tools are refreshed.",
+        ].join(" "),
         { cause: error },
       );
     }
     if (hasErrorCode(error, "NoPermissions")) {
       throw new LanguageModelToolInvocationError(
         "permission-denied",
-        `Permission was denied for registered language-model tool "${providerName}".`,
+        [
+          `Permission was denied for registered language-model tool "${providerName}"; it was not authorized to complete.`,
+          "Do not retry unchanged until the user grants permission or trusts the provider.",
+        ].join(" "),
         { cause: error },
       );
     }
