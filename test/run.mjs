@@ -31,6 +31,7 @@ const tests = [
   "toolExecutionLedger.integration",
   "pendingApprovalRecovery.integration",
   "interruptedContinuation.integration",
+  "futureGoal.integration",
   "persistenceService.integration",
   "recovery.integration",
   "repositories.integration",
