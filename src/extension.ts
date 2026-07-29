@@ -25,6 +25,7 @@ import {
   discoverProjectCustomizations,
   type ProjectCustomizations,
 } from "./projectCustomizations";
+import { resolveAgentToolPolicy } from "./agentToolPolicy";
 
 let currentPanel: DeepAgentsChatPanel | undefined;
 const processAllowedTools = new Map<string, Set<string>>();
@@ -143,11 +144,23 @@ function renderProjectCustomizations(
   output.clear();
   output.appendLine(`Workspace: ${discovered.workspaceRoot}`);
   output.appendLine("");
+  const serverNames = Object.keys(discovered.mcp?.servers ?? {}).sort();
+  const policyDiagnosticLines: string[] = [];
   output.appendLine(`Agents (${discovered.agents.length})`);
   for (const agent of discovered.agents) {
-    const tools =
-      agent.tools === undefined ? "<all>" : JSON.stringify(agent.tools);
-    output.appendLine(`- ${agent.name} [${agent.id}] tools=${tools}`);
+    const configuredTools =
+      agent.tools === undefined ? "<omitted>" : JSON.stringify(agent.tools);
+    const policy = resolveAgentToolPolicy(agent.tools, {
+      mcpServerNames: serverNames,
+    });
+    output.appendLine(
+      `- ${agent.name} [${agent.id}] configured=${configuredTools} resolved=${JSON.stringify(policy.resolvedTools)}`,
+    );
+    for (const diagnostic of policy.diagnostics) {
+      policyDiagnosticLines.push(
+        `- ${diagnostic.severity.toUpperCase()} ${relative(discovered.workspaceRoot, agent.filePath)} [${diagnostic.code}] ${diagnostic.message}`,
+      );
+    }
   }
   output.appendLine("");
   output.appendLine(`Skills (${discovered.skills.length})`);
@@ -155,7 +168,6 @@ function renderProjectCustomizations(
     output.appendLine(`- ${skill.name}: ${skill.description}`);
   }
   output.appendLine("");
-  const serverNames = Object.keys(discovered.mcp?.servers ?? {}).sort();
   output.appendLine(`MCP servers (${serverNames.length})`);
   for (const serverName of serverNames) {
     const source = discovered.mcp?.sources[serverName];
@@ -165,11 +177,16 @@ function renderProjectCustomizations(
     output.appendLine(`- ${serverName} (${sourcePath})`);
   }
   output.appendLine("");
-  output.appendLine(`Diagnostics (${discovered.diagnostics.length})`);
+  output.appendLine(
+    `Diagnostics (${discovered.diagnostics.length + policyDiagnosticLines.length})`,
+  );
   for (const diagnostic of discovered.diagnostics) {
     output.appendLine(
       `- ${diagnostic.severity.toUpperCase()} ${diagnostic.path} [${diagnostic.code}] ${diagnostic.message}`,
     );
+  }
+  for (const diagnosticLine of policyDiagnosticLines) {
+    output.appendLine(diagnosticLine);
   }
 }
 

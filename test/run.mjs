@@ -3,6 +3,8 @@ import { spawnSync } from "node:child_process";
 
 const tests = [
   "adapter.integration",
+  "agentToolPolicy.test",
+  "agentToolPolicy.integration",
   "approval.integration",
   "conversationReplayProjection.test",
   "executeCommandTool.test",
