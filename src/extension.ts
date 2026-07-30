@@ -65,6 +65,12 @@ import {
 } from "./vscodeWebBrowserTools";
 import { resolveComposerControlState } from "./composerState";
 import {
+  DEFAULT_EXECUTION_MODE,
+  isExecutionMode,
+  shouldAutoApprove,
+  type ExecutionMode,
+} from "./executionMode";
+import {
   createSteeringMiddleware,
   pendingSteeringEntriesFromEvents,
   SteeringQueue,
@@ -363,6 +369,7 @@ interface ChatSession {
   title: string;
   selectedModelKey: string;
   selectedAgentId: string | null;
+  executionMode: ExecutionMode;
   transcript: Array<{ role: "user" | "assistant"; content: string }>;
   allowedTools: Set<string>;
 }
@@ -714,6 +721,14 @@ class DeepAgentsChatPanel {
         this.persistence.sessions.setAgent(this.activeSession.id, agentId);
         await this.postWorkbenchState(false);
       }
+      return;
+    }
+    if (
+      raw.type === "selectExecutionMode" &&
+      !this.isSessionBusy(this.activeSession.id)
+    ) {
+      this.activeSession.executionMode = raw.mode;
+      await this.postWorkbenchState(false);
       return;
     }
     if (raw.type === "newSession") {
@@ -1604,8 +1619,11 @@ class DeepAgentsChatPanel {
           message: freshnessError,
         }));
       } else {
-        this.persistence.runs.setExecutionStatus(runId, "waiting_approval");
-        this.setRunPhase(controller, "waiting_approval");
+        const automatic = shouldAutoApprove(session.executionMode);
+        if (!automatic) {
+          this.persistence.runs.setExecutionStatus(runId, "waiting_approval");
+          this.setRunPhase(controller, "waiting_approval");
+        }
         for (const toolCallId of approvalToolCallIds) {
           this.persistence.toolExecutions.transition(
             runId,
@@ -1613,15 +1631,20 @@ class DeepAgentsChatPanel {
             "waiting_approval",
           );
         }
-        const decision = await this.requestApproval(
-          actions,
-          approvalToolCallIds,
-          runId,
-          session.id,
-          controller,
-          presentation,
-        );
-        const approved = decision === "once" || decision === "session";
+        const decision = automatic
+          ? "auto"
+          : await this.requestApproval(
+              actions,
+              approvalToolCallIds,
+              runId,
+              session.id,
+              controller,
+              presentation,
+            );
+        const approved =
+          decision === "auto" ||
+          decision === "once" ||
+          decision === "session";
         this.mutationCoordinator.resolveApproval(
           runId,
           approvalToolCallIds,
@@ -1631,6 +1654,18 @@ class DeepAgentsChatPanel {
           for (const action of actions) {
             session.allowedTools.add(action.name);
           }
+        }
+        if (decision === "auto") {
+          actions.forEach((action, index) => {
+            this.persistence.approvals.record({
+              sessionId: session.id,
+              runId,
+              toolCallId: approvalToolCallIds[index],
+              toolName: action.name,
+              decision,
+              processInstanceId: this.processInstanceId,
+            });
+          });
         }
         decisions = actions.map(() =>
           approved
@@ -1962,6 +1997,7 @@ class DeepAgentsChatPanel {
         : undefined,
       selectedModelKey: this.selectedModelKey,
       selectedAgentId: active.selectedAgentId,
+      executionMode: active.executionMode,
       agents: this.agentRegistry.listUserInvocable().map((agent) => ({
         id: agent.id,
         name: agent.name,
@@ -2113,6 +2149,7 @@ type WebviewMessage =
   | { type: "clear" }
   | { type: "selectModel"; modelKey: string }
   | { type: "selectAgent"; agentId: string }
+  | { type: "selectExecutionMode"; mode: ExecutionMode }
   | { type: "newSession" }
   | { type: "selectSession"; sessionId: string }
   | { type: "renameSession"; sessionId: string; title: string }
@@ -2168,6 +2205,9 @@ function isWebviewMessage(value: unknown): value is WebviewMessage {
   }
   if (type === "selectAgent") {
     return typeof (value as { agentId?: unknown }).agentId === "string";
+  }
+  if (type === "selectExecutionMode") {
+    return isExecutionMode((value as { mode?: unknown }).mode);
   }
   if (type === "selectSession" || type === "deleteSession") {
     return typeof (value as { sessionId?: unknown }).sessionId === "string";
@@ -2431,6 +2471,7 @@ function createSession(
     title: stored.title,
     selectedModelKey,
     selectedAgentId: null,
+    executionMode: DEFAULT_EXECUTION_MODE,
     transcript: [],
     allowedTools: allowedToolsForSession(processInstanceId, stored.id),
   };
@@ -2447,6 +2488,7 @@ function loadSessions(
     title: session.title,
     selectedModelKey: session.selectedModelKey ?? fallbackModelKey,
     selectedAgentId: session.selectedAgentId,
+    executionMode: DEFAULT_EXECUTION_MODE,
     transcript: persistence.conversationEvents
       .list(session.id)
       .filter(
@@ -2890,12 +2932,49 @@ function renderWebview(
     textarea:focus { outline: 1px solid var(--vscode-focusBorder); }
     .actions {
       display: flex;
+      flex-wrap: wrap;
       justify-content: space-between;
       align-items: center;
       gap: 8px;
       margin-top: 8px;
     }
-    .primary-actions { display: flex; gap: 8px; }
+    .primary-actions {
+      display: flex;
+      gap: 8px;
+      margin-left: auto;
+    }
+    .execution-modes {
+      display: inline-flex;
+      align-items: stretch;
+      border: 1px solid var(--vscode-button-border, var(--vscode-panel-border));
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .execution-mode {
+      min-width: 58px;
+      padding: 4px 8px;
+      border: 0;
+      border-right: 1px solid var(--vscode-button-border, var(--vscode-panel-border));
+      border-radius: 0;
+      color: var(--vscode-button-secondaryForeground);
+      background: var(--vscode-button-secondaryBackground);
+    }
+    .execution-mode:last-child { border-right: 0; }
+    .execution-mode[aria-pressed="true"] {
+      color: var(--vscode-button-foreground);
+      background: var(--vscode-button-background);
+    }
+    .execution-mode.auto[aria-pressed="true"] {
+      color: var(--vscode-inputValidation-warningForeground, var(--vscode-button-foreground));
+      background: var(--vscode-inputValidation-warningBackground);
+      box-shadow: inset 0 0 0 1px var(--vscode-inputValidation-warningBorder);
+    }
+    .execution-mode:focus-visible {
+      position: relative;
+      z-index: 1;
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: -1px;
+    }
     #primary-action {
       width: 34px;
       height: 30px;
@@ -2954,6 +3033,35 @@ function renderWebview(
             <select id="model-select" aria-label="Language model"></select>
           </div>
           <div class="primary-actions">
+            <div
+              id="execution-modes"
+              class="execution-modes"
+              role="group"
+              aria-label="Execution mode"
+            >
+              <button
+                class="execution-mode"
+                type="button"
+                data-mode="plan"
+                title="Plan mode will be available in the next implementation slice"
+                aria-pressed="false"
+                disabled
+              >Plan</button>
+              <button
+                class="execution-mode"
+                type="button"
+                data-mode="default"
+                title="Ask for approval before protected operations"
+                aria-pressed="true"
+              >Default</button>
+              <button
+                class="execution-mode auto"
+                type="button"
+                data-mode="auto"
+                title="Automatically approve capabilities available to this agent"
+                aria-pressed="false"
+              >Auto</button>
+            </div>
             <button id="primary-action" type="submit" title="Send message" aria-label="Send message">
               <span aria-hidden="true">→</span>
             </button>
@@ -2973,6 +3081,10 @@ function renderWebview(
     const sessionList = document.getElementById("session-list");
     const agentSelect = document.getElementById("agent-select");
     const modelSelect = document.getElementById("model-select");
+    const executionModes = document.getElementById("execution-modes");
+    const executionModeButtons = Array.from(
+      executionModes.querySelectorAll("[data-mode]"),
+    );
     const subtitle = document.getElementById("subtitle");
     let draft = null;
     let running = false;
@@ -3402,6 +3514,15 @@ function renderWebview(
       updateComposerControl();
     }
 
+    function renderExecutionMode(executionMode) {
+      for (const button of executionModeButtons) {
+        button.setAttribute(
+          "aria-pressed",
+          String(button.dataset.mode === executionMode),
+        );
+      }
+    }
+
     function setRunning(value) {
       running = value;
       updateComposerControl();
@@ -3409,6 +3530,9 @@ function renderWebview(
       newChat.disabled = false;
       agentSelect.disabled = value;
       modelSelect.disabled = value;
+      for (const button of executionModeButtons) {
+        button.disabled = value || button.dataset.mode === "plan";
+      }
       if (!value) prompt.focus();
     }
 
@@ -3458,6 +3582,31 @@ function renderWebview(
         });
       }
     });
+    executionModes.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-mode]");
+      if (!running && button && !button.disabled) {
+        vscode.postMessage({
+          type: "selectExecutionMode",
+          mode: button.dataset.mode,
+        });
+      }
+    });
+    executionModes.addEventListener("keydown", (event) => {
+      if (
+        running ||
+        (event.key !== "ArrowLeft" && event.key !== "ArrowRight")
+      ) {
+        return;
+      }
+      const enabled = executionModeButtons.filter((button) => !button.disabled);
+      const current = enabled.indexOf(document.activeElement);
+      if (current < 0) return;
+      event.preventDefault();
+      const direction = event.key === "ArrowRight" ? 1 : -1;
+      const next = enabled[(current + direction + enabled.length) % enabled.length];
+      next.focus();
+      next.click();
+    });
 
     window.addEventListener("message", ({ data }) => {
       switch (data.type) {
@@ -3467,6 +3616,7 @@ function renderWebview(
           renderSessions(data.sessions);
           renderAgents(data.agents, data.selectedAgentId);
           renderModels(data.models, data.selectedModelKey);
+          renderExecutionMode(data.executionMode);
           if (data.replaceMessages) {
             replaceConversation(data.replayItems);
             renderRecoveries(data.recoveries);

@@ -26,6 +26,7 @@ const tests = [
   "vscodeWebBrowserTools.integration",
   "command.integration",
   "composerState.test",
+  "executionMode.test",
   "steeringQueue.test",
   "steeringQueue.integration",
   "repeatedToolFailure.test",

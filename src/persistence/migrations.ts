@@ -318,6 +318,50 @@ export const APP_MIGRATIONS: readonly Migration[] = [
         ON conversation_events(session_id, sequence);
     `,
   },
+  {
+    version: 5,
+    name: "automatic_approval_decisions",
+    sql: `
+      CREATE TABLE approval_decisions_next (
+        id TEXT PRIMARY KEY,
+        session_id TEXT REFERENCES chat_sessions(id) ON DELETE CASCADE,
+        run_id TEXT REFERENCES agent_runs(id) ON DELETE CASCADE,
+        tool_call_id TEXT,
+        tool_name TEXT NOT NULL,
+        decision TEXT NOT NULL CHECK (
+          decision IN ('once', 'session', 'deny', 'auto')
+        ),
+        process_instance_id TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      INSERT INTO approval_decisions_next (
+        id,
+        session_id,
+        run_id,
+        tool_call_id,
+        tool_name,
+        decision,
+        process_instance_id,
+        created_at
+      )
+      SELECT
+        id,
+        session_id,
+        run_id,
+        tool_call_id,
+        tool_name,
+        decision,
+        process_instance_id,
+        created_at
+      FROM approval_decisions;
+
+      DROP TABLE approval_decisions;
+      ALTER TABLE approval_decisions_next RENAME TO approval_decisions;
+      CREATE INDEX approval_decisions_session_created_idx
+        ON approval_decisions(session_id, created_at);
+    `,
+  },
 ];
 
 export function applyMigrations(
