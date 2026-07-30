@@ -14,6 +14,7 @@ function agent(
 ): ProjectAgentDefinition {
   return {
     id,
+    scopePath: "",
     filePath: `/.github/agents/${id}.agent.md`,
     name,
     userInvocable,
@@ -26,20 +27,25 @@ function agent(
 const hidden = agent("hidden", "Hidden", false);
 const writer = agent("writer", "Technical Writer");
 const coder = agent("coder", "Coder");
+const nestedCoder = {
+  ...agent("repo-1/coder", "Coder"),
+  scopePath: "repo-1",
+};
 const customizations: ProjectCustomizations = {
   workspaceRoot: "/workspace",
-  agents: [writer, hidden, coder],
+  agents: [writer, hidden, coder, nestedCoder],
   skills: [],
   diagnostics: [],
 };
 
 const registry = new ProjectAgentRegistry(customizations);
 assert.equal(registry.get("writer"), writer);
+assert.equal(registry.get("repo-1/coder"), nestedCoder);
 assert.equal(registry.get("missing"), undefined);
 assert.equal(registry.get(null), undefined);
 assert.deepEqual(
   registry.listUserInvocable().map((item) => item.id),
-  ["coder", "writer"],
+  ["coder", "repo-1/coder", "writer"],
 );
 
 console.log(

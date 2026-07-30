@@ -175,7 +175,7 @@ async function main(): Promise<void> {
         policy: childPolicy,
         subagents: [],
         skills: resolveProjectAgentSkills(
-          { skills: ["child-skill"] },
+          { scopePath: "", skills: ["child-skill"] },
           availableSkills,
         ),
         workspaceRoot,
@@ -211,7 +211,7 @@ async function main(): Promise<void> {
           description: "Checks child-scoped skills.",
         }],
         skills: resolveProjectAgentSkills(
-          { skills: ["parent-skill"] },
+          { scopePath: "", skills: ["parent-skill"] },
           availableSkills,
         ),
         workspaceRoot,
@@ -251,6 +251,7 @@ function skill(
   name: string,
 ): ProjectSkillDefinition {
   return {
+    scopePath: "",
     directoryPath: join(workspaceRoot, ".github", "skills", name),
     filePath: join(
       workspaceRoot,

@@ -96,14 +96,24 @@ export function resolveProjectAgentDelegation(
   const seen = new Set<string>();
 
   for (const configuredChildId of agent.agents ?? []) {
-    const normalizedChildId = configuredChildId.trim().toLocaleLowerCase();
-    if (!normalizedChildId || seen.has(normalizedChildId)) {
+    const child = resolveAgentReference(
+      agent,
+      configuredChildId,
+      agentsById,
+    );
+    const normalizedReference = configuredChildId
+      .trim()
+      .replaceAll("\\", "/")
+      .replace(/^\.\/+/, "")
+      .toLocaleLowerCase();
+    if (!normalizedReference) {
       continue;
     }
-    seen.add(normalizedChildId);
-
-    const child = agentsById.get(normalizedChildId);
     if (!child) {
+      if (seen.has(normalizedReference)) {
+        continue;
+      }
+      seen.add(normalizedReference);
       diagnostics.push({
         severity: "warning",
         code: "delegation.unknown-agent",
@@ -113,6 +123,11 @@ export function resolveProjectAgentDelegation(
       });
       continue;
     }
+    const normalizedChildId = child.id.toLocaleLowerCase();
+    if (seen.has(normalizedChildId)) {
+      continue;
+    }
+    seen.add(normalizedChildId);
     if (child.disableModelInvocation) {
       diagnostics.push({
         severity: "warning",
@@ -165,14 +180,44 @@ function reachesAgent(
   visited.add(currentId);
 
   for (const configuredChildId of current.agents ?? []) {
-    const childId = configuredChildId.trim().toLocaleLowerCase();
-    if (childId === targetId.toLocaleLowerCase()) {
+    const child = resolveAgentReference(
+      current,
+      configuredChildId,
+      agentsById,
+    );
+    if (child?.id.toLocaleLowerCase() === targetId.toLocaleLowerCase()) {
       return true;
     }
-    const child = agentsById.get(childId);
     if (child && reachesAgent(child, targetId, agentsById, visited)) {
       return true;
     }
   }
   return false;
+}
+
+function resolveAgentReference(
+  parent: ProjectAgentDefinition,
+  configuredReference: string,
+  agentsById: ReadonlyMap<string, ProjectAgentDefinition>,
+): ProjectAgentDefinition | undefined {
+  const normalizedReference = configuredReference
+    .trim()
+    .replaceAll("\\", "/")
+    .replace(/^\.\/+/, "")
+    .toLocaleLowerCase();
+  if (!normalizedReference) {
+    return undefined;
+  }
+  if (normalizedReference.includes("/")) {
+    return agentsById.get(normalizedReference);
+  }
+  if (parent.scopePath) {
+    const local = agentsById.get(
+      `${parent.scopePath}/${normalizedReference}`.toLocaleLowerCase(),
+    );
+    if (local) {
+      return local;
+    }
+  }
+  return agentsById.get(normalizedReference);
 }

@@ -14,6 +14,7 @@ export interface CustomizationDiagnostic {
 
 export interface ProjectAgentDefinition {
   id: string;
+  scopePath: string;
   filePath: string;
   name: string;
   description?: string;
@@ -28,6 +29,7 @@ export interface ProjectAgentDefinition {
 }
 
 export interface ProjectSkillDefinition {
+  scopePath: string;
   directoryPath: string;
   filePath: string;
   name: string;
@@ -64,22 +66,61 @@ interface MutableDiscovery {
   diagnostics: CustomizationDiagnostic[];
 }
 
+interface GithubCustomizationScope {
+  scopePath: string;
+  githubDirectory: string;
+}
+
+const RECURSIVE_DISCOVERY_EXCLUDED_DIRECTORIES = new Set([
+  ".git",
+  ".next",
+  ".pnpm-store",
+  ".turbo",
+  ".cache",
+  ".venv",
+  ".yarn",
+  "__pycache__",
+  "build",
+  "coverage",
+  "dist",
+  "node_modules",
+  "out",
+  "target",
+  "vendor",
+  "venv",
+]);
+
 export async function discoverProjectCustomizations(
   workspaceRoot: string,
 ): Promise<ProjectCustomizations> {
   const state: MutableDiscovery = { diagnostics: [] };
-  const githubRoot = join(workspaceRoot, ".github");
-  const agents = await discoverAgents(
-    workspaceRoot,
-    join(githubRoot, "agents"),
-    state,
-  );
-  const skills = await discoverSkills(
-    workspaceRoot,
-    join(githubRoot, "skills"),
-    state,
-  );
+  const scopes = await discoverGithubCustomizationScopes(workspaceRoot);
+  const agents = (
+    await Promise.all(
+      scopes.map((scope) =>
+        discoverAgents(
+          workspaceRoot,
+          scope,
+          join(scope.githubDirectory, "agents"),
+          state,
+        )
+      ),
+    )
+  ).flat().sort((left, right) => left.id.localeCompare(right.id));
+  const skills = (
+    await Promise.all(
+      scopes.map((scope) =>
+        discoverSkills(
+          workspaceRoot,
+          scope,
+          join(scope.githubDirectory, "skills"),
+          state,
+        )
+      ),
+    )
+  ).flat().sort(compareSkills);
   validateAgentSkillReferences(workspaceRoot, agents, skills, state);
+  const githubRoot = join(workspaceRoot, ".github");
   const mcp = await discoverMcp(
     workspaceRoot,
     join(githubRoot, "mcp.json"),
@@ -98,6 +139,7 @@ export async function discoverProjectCustomizations(
 
 async function discoverAgents(
   workspaceRoot: string,
+  scope: GithubCustomizationScope,
   agentsDirectory: string,
   state: MutableDiscovery,
 ): Promise<ProjectAgentDefinition[]> {
@@ -119,9 +161,11 @@ async function discoverAgents(
       continue;
     }
 
-    const id = entry.name.slice(0, -".agent.md".length);
+    const localId = entry.name.slice(0, -".agent.md".length);
+    const id = qualifiedCustomizationName(scope.scopePath, localId);
     const name =
-      optionalString(parsed.metadata.name, "name", displayPath, state) ?? id;
+      optionalString(parsed.metadata.name, "name", displayPath, state) ??
+      localId;
     if (!name.trim()) {
       addDiagnostic(
         state,
@@ -211,6 +255,7 @@ async function discoverAgents(
 
     agents.push({
       id,
+      scopePath: scope.scopePath,
       filePath: absolutePath,
       name,
       ...(description !== undefined ? { description } : {}),
@@ -230,6 +275,7 @@ async function discoverAgents(
 
 async function discoverSkills(
   workspaceRoot: string,
+  scope: GithubCustomizationScope,
   skillsDirectory: string,
   state: MutableDiscovery,
 ): Promise<ProjectSkillDefinition[]> {
@@ -300,6 +346,7 @@ async function discoverSkills(
     names.set(normalizedName, displayPath);
 
     skills.push({
+      scopePath: scope.scopePath,
       directoryPath,
       filePath,
       name,
@@ -309,32 +356,30 @@ async function discoverSkills(
     });
   }
 
-  return skills.sort((left, right) => left.name.localeCompare(right.name));
+  return skills.sort(compareSkills);
 }
 
 export function resolveProjectAgentSkills(
-  agent: Pick<ProjectAgentDefinition, "skills">,
+  agent: Pick<ProjectAgentDefinition, "scopePath" | "skills">,
   availableSkills: readonly ProjectSkillDefinition[],
 ): ProjectSkillDefinition[] {
   if (agent.skills === undefined) {
-    return [...availableSkills];
+    return effectiveDefaultSkills(agent.scopePath, availableSkills);
   }
-  const byName = new Map(
-    availableSkills.map((skill) => [
-      skill.name.toLocaleLowerCase(),
-      skill,
-    ]),
-  );
   const resolved: ProjectSkillDefinition[] = [];
   const seen = new Set<string>();
-  for (const configuredName of agent.skills) {
-    const normalizedName = configuredName.trim().toLocaleLowerCase();
-    if (!normalizedName || seen.has(normalizedName)) {
+  for (const configuredReference of agent.skills) {
+    const skill = resolveSkillReference(
+      agent.scopePath,
+      configuredReference,
+      availableSkills,
+    );
+    if (!skill) {
       continue;
     }
-    seen.add(normalizedName);
-    const skill = byName.get(normalizedName);
-    if (skill) {
+    const qualifiedName = qualifiedSkillName(skill).toLocaleLowerCase();
+    if (!seen.has(qualifiedName)) {
+      seen.add(qualifiedName);
       resolved.push(skill);
     }
   }
@@ -347,9 +392,6 @@ function validateAgentSkillReferences(
   skills: readonly ProjectSkillDefinition[],
   state: MutableDiscovery,
 ): void {
-  const availableNames = new Set(
-    skills.map((skill) => skill.name.toLocaleLowerCase()),
-  );
   for (const agent of agents) {
     const seen = new Set<string>();
     for (const configuredName of agent.skills ?? []) {
@@ -357,7 +399,7 @@ function validateAgentSkillReferences(
       if (
         !normalizedName ||
         seen.has(normalizedName) ||
-        availableNames.has(normalizedName)
+        resolveSkillReference(agent.scopePath, configuredName, skills)
       ) {
         continue;
       }
@@ -371,6 +413,130 @@ function validateAgentSkillReferences(
       );
     }
   }
+}
+
+function effectiveDefaultSkills(
+  agentScopePath: string,
+  availableSkills: readonly ProjectSkillDefinition[],
+): ProjectSkillDefinition[] {
+  const effectiveScopes = agentScopePath
+    ? [agentScopePath, ""]
+    : [""];
+  const resolved: ProjectSkillDefinition[] = [];
+  const seenNames = new Set<string>();
+  for (const scopePath of effectiveScopes) {
+    for (const skill of availableSkills) {
+      const normalizedName = skill.name.toLocaleLowerCase();
+      if (
+        skill.scopePath === scopePath &&
+        !seenNames.has(normalizedName)
+      ) {
+        seenNames.add(normalizedName);
+        resolved.push(skill);
+      }
+    }
+  }
+  return resolved;
+}
+
+function resolveSkillReference(
+  agentScopePath: string,
+  configuredReference: string,
+  availableSkills: readonly ProjectSkillDefinition[],
+): ProjectSkillDefinition | undefined {
+  const normalizedReference = normalizeCustomizationReference(
+    configuredReference,
+  );
+  if (!normalizedReference) {
+    return undefined;
+  }
+  if (normalizedReference.includes("/")) {
+    return availableSkills.find(
+      (skill) =>
+        qualifiedSkillName(skill).toLocaleLowerCase() ===
+        normalizedReference.toLocaleLowerCase(),
+    );
+  }
+  const effectiveScopes = agentScopePath
+    ? [agentScopePath, ""]
+    : [""];
+  for (const scopePath of effectiveScopes) {
+    const skill = availableSkills.find(
+      (candidate) =>
+        candidate.scopePath === scopePath &&
+        candidate.name.toLocaleLowerCase() ===
+          normalizedReference.toLocaleLowerCase(),
+    );
+    if (skill) {
+      return skill;
+    }
+  }
+  return undefined;
+}
+
+export function qualifiedSkillName(
+  skill: Pick<ProjectSkillDefinition, "scopePath" | "name">,
+): string {
+  return qualifiedCustomizationName(skill.scopePath, skill.name);
+}
+
+function compareSkills(
+  left: ProjectSkillDefinition,
+  right: ProjectSkillDefinition,
+): number {
+  return (
+    left.scopePath.localeCompare(right.scopePath) ||
+    left.name.localeCompare(right.name)
+  );
+}
+
+async function discoverGithubCustomizationScopes(
+  workspaceRoot: string,
+): Promise<GithubCustomizationScope[]> {
+  const scopes: GithubCustomizationScope[] = [];
+
+  const visit = async (directory: string): Promise<void> => {
+    const entries = (await readDirectoryIfPresent(directory))
+      .sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+      const childPath = join(directory, entry.name);
+      if (entry.name === ".github") {
+        const scopePath = normalizeProjectRelativePath(
+          relative(workspaceRoot, directory),
+        );
+        scopes.push({ scopePath, githubDirectory: childPath });
+        continue;
+      }
+      if (RECURSIVE_DISCOVERY_EXCLUDED_DIRECTORIES.has(entry.name)) {
+        continue;
+      }
+      await visit(childPath);
+    }
+  };
+
+  await visit(workspaceRoot);
+  return scopes.sort(
+    (left, right) =>
+      left.scopePath.localeCompare(right.scopePath),
+  );
+}
+
+function qualifiedCustomizationName(
+  scopePath: string,
+  localName: string,
+): string {
+  return scopePath ? `${scopePath}/${localName}` : localName;
+}
+
+function normalizeCustomizationReference(reference: string): string {
+  return reference.trim().replaceAll("\\", "/").replace(/^\.\/+/, "");
+}
+
+function normalizeProjectRelativePath(path: string): string {
+  return path === "." ? "" : path.replaceAll("\\", "/");
 }
 
 async function discoverMcp(
