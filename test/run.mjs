@@ -13,6 +13,8 @@ const tests = [
   "projectAgentRegistry.test",
   "projectAgentDelegation.test",
   "projectAgentDelegation.integration",
+  "projectAgentSystemPrompt.test",
+  "projectAgentSystemPrompt.integration",
   "projectSkillsMiddleware.test",
   "projectSkillsMiddleware.integration",
   "vscodeLanguageModelTools.test",

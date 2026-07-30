@@ -70,6 +70,7 @@ name: Coder
 description: Implements focused repository changes.
 argument-hint: Describe the requested change.
 tools: [read, search, edit, execute]
+skills: [code-review]
 agents: [reviewer]
 user-invocable: true
 disable-model-invocation: false
@@ -83,15 +84,18 @@ Implement the smallest coherent change and report the verification performed.
 - `user-invocable` defaults to `true`; `false` hides the agent from the workbench selector.
 - `disable-model-invocation` defaults to `false`; `true` prevents another agent from delegating to it.
 - `tools` controls the agent's capabilities and is fail-closed.
+- `skills` controls which discovered project skills are available to the agent.
 - `agents` is the exact allowlist of child agent IDs available for delegation.
 
 New chats have no implicit project agent. The chosen agent and model are stored per chat. Agent instructions are wrapped as explicit custom instructions because VS Code's model API does not support system-role messages.
 
 ### Tool policy
 
-`tools` is fail-closed:
+Every project agent receives a read/search/planning baseline:
+`ls`, `read_file`, `glob`, `grep`, and `write_todos`. The `tools` field adds
+capabilities beyond that baseline:
 
-- An omitted `tools` field or `tools: []` exposes no tools.
+- An omitted `tools` field or `tools: []` exposes only the baseline tools.
 - `tools: ["*"]` exposes all tools that Bridgit can resolve for that run.
 - Built-in aliases are `read`, `search`, `edit`/`write`, `execute`/`shell`/`bash`/`powershell`, `agent`, and `todo`/`todos`.
 - Exact built-in names such as `read_file` and `execute_command` are also accepted.
@@ -100,7 +104,12 @@ New chats have no implicit project agent. The chosen agent and model are stored 
 - `vscode` and `vscode/*` are intentionally ignored; there is no general VS Code command bridge.
 - Unknown capabilities and MCP servers produce diagnostics and grant nothing.
 
-The prompt for every model call states which tools are actually exposed. If a requested operation is impossible, the agent is instructed to identify the missing capability and the relevant `tools` change instead of pretending it succeeded.
+The prompt for every model call is assembled from the resolved runtime
+capabilities. It describes only the filesystem, command, todo, delegation,
+external, and skill capabilities actually available to that agent. If a
+requested operation is impossible, the agent is instructed to identify the
+missing capability and the relevant `tools` change instead of pretending it
+succeeded.
 
 ### Project skills
 
@@ -115,7 +124,15 @@ description: Review a selected change for correctness and test coverage.
 Inspect the requested change and recommend focused verification.
 ```
 
-Valid skills are included in the selected agent's runtime guidance and refresh for existing checkpointed chats. Skills provide instructions only: they never expand the agent's tool policy or authorize side effects.
+An agent with no `skills` field receives all discovered skills. `skills: []`
+receives none, while `skills: [code-review, another-skill]` receives only those
+named skills. Skill names are matched case-insensitively against the `name` in
+`SKILL.md`; unknown names produce diagnostics and grant nothing. The same policy
+is resolved independently when the agent owns a conversation or runs as a child.
+
+Resolved skills refresh for existing checkpointed chats. Skills provide
+instructions only: they never expand the agent's tool policy or authorize side
+effects.
 
 ### MCP servers
 

@@ -29,9 +29,11 @@ import {
   createToolExecutionLedgerMiddleware,
   encodeToolResult,
   hashToolInput,
+  matchPendingApprovalToolCallIds,
 } from "./toolExecutionLedger";
 import {
   discoverProjectCustomizations,
+  resolveProjectAgentSkills,
   type ProjectAgentDefinition,
   type ProjectCustomizations,
 } from "./projectCustomizations";
@@ -43,12 +45,12 @@ import {
 import { ProjectAgentRegistry } from "./projectAgentRegistry";
 import {
   createProjectAgentDelegationGuardMiddleware,
-  PROJECT_AGENT_DELEGATION_SYSTEM_PROMPT,
-  PROJECT_AGENT_TASK_DESCRIPTION,
   resolveProjectAgentDelegation,
 } from "./projectAgentDelegation";
 import { configureDeepAgentSystemPrompt } from "./deepAgentSystemPrompt";
-import { createProjectSkillsMiddleware } from "./projectSkillsMiddleware";
+import {
+  createProjectAgentSystemPromptMiddleware,
+} from "./projectAgentSystemPrompt";
 import {
   renderRegisteredLanguageModelToolInventory,
   snapshotRegisteredLanguageModelTools,
@@ -1435,8 +1437,7 @@ class DeepAgentsChatPanel {
           defaultModel: adapter,
           subagents,
           generalPurposeAgent: false,
-          systemPrompt: PROJECT_AGENT_DELEGATION_SYSTEM_PROMPT,
-          taskDescription: PROJECT_AGENT_TASK_DESCRIPTION,
+          systemPrompt: null,
         }),
         createProjectAgentDelegationGuardMiddleware(
           subagents.map((subagent) => subagent.name),
@@ -1458,10 +1459,22 @@ class DeepAgentsChatPanel {
           policy,
           modelNameAliases,
         ),
-        createProjectSkillsMiddleware(
-          this.customizations.skills,
-          this.workspaceRoot,
-        ),
+        createProjectAgentSystemPromptMiddleware({
+          agentInstructions: agentDefinition.body,
+          includeDeepAgentCorePrompt:
+            INCLUDE_DEEPAGENTS_DEFAULT_SYSTEM_PROMPT,
+          policy,
+          subagents: subagents.map((subagent) => ({
+            name: subagent.name,
+            description: subagent.description,
+          })),
+          skills: resolveProjectAgentSkills(
+            agentDefinition,
+            this.customizations.skills,
+          ),
+          workspaceRoot: this.workspaceRoot,
+          modelNameAliases,
+        }),
         this.mutationCoordinator.createMiddleware({
           runId,
           hooks: this.mutationHooks(runController),
@@ -1494,8 +1507,8 @@ class DeepAgentsChatPanel {
         ...browserApprovalInterrupts,
       },
       systemPrompt: configureDeepAgentSystemPrompt(
-        agentDefinition.body,
-        INCLUDE_DEEPAGENTS_DEFAULT_SYSTEM_PROMPT,
+        "",
+        false,
       ),
     });
   }
@@ -1781,24 +1794,10 @@ class DeepAgentsChatPanel {
     runId: string,
     actions: ApprovalAction[],
   ): string[] {
-    const used = new Set<string>();
-    const durableCalls = this.persistence.toolExecutions.list(runId);
-    return actions.map((action) => {
-      const inputHash = hashToolInput(action.args);
-      for (const toolCall of durableCalls) {
-        if (
-          !used.has(toolCall.toolCallId) &&
-          toolCall.toolName === action.name &&
-          toolCall.inputHash === inputHash
-        ) {
-          used.add(toolCall.toolCallId);
-          return toolCall.toolCallId;
-        }
-      }
-      throw new Error(
-        `Could not correlate approval action "${action.name}" with a durable tool call.`,
-      );
-    });
+    return matchPendingApprovalToolCallIds(
+      this.persistence.toolExecutions.list(runId),
+      actions,
+    );
   }
 
   private findPendingApprovalRequestId(

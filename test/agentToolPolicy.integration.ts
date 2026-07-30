@@ -68,12 +68,12 @@ async function main(): Promise<void> {
 
   assert.deepEqual(
     requests[0]?.options.tools?.map((tool) => tool.name).sort(),
-    ["ls", "read_file"],
-    "Only the resolved read tools should be visible to the model.",
+    ["glob", "grep", "ls", "read_file", "write_todos"],
+    "The universal read, search, and planning baseline should be visible.",
   );
   assert.match(
     JSON.stringify(requests[0]?.messages ?? []),
-    /Tools exposed for this model call: ls, read_file/,
+    /Tools exposed for this model call: glob, grep, ls, read_file, write_todos/,
   );
   assert.match(
     JSON.stringify(requests[0]?.messages ?? []),
@@ -112,10 +112,13 @@ async function main(): Promise<void> {
   await noToolsAgent.invoke({
     messages: [{ role: "user", content: "Answer without tools" }],
   });
-  assert.deepEqual(noToolsRequests[0]?.tools, []);
+  assert.deepEqual(
+    noToolsRequests[0]?.tools?.map((tool) => tool.name).sort(),
+    ["glob", "grep", "ls", "read_file", "write_todos"],
+  );
 
   console.log(
-    "Agent tool policy integration passed: model filtering and fail-closed invocation guard",
+    "Agent tool policy integration passed: baseline exposure and invocation guard",
   );
 }
 

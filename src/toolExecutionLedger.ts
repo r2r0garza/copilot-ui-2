@@ -9,6 +9,7 @@ import { createMiddleware, type ToolCallRequest } from "langchain";
 import {
   ToolExecutionBlockedError,
   ToolExecutionIntegrityError,
+  type ToolExecutionRecord,
   type ToolEffectClass,
   type ToolExecutionRepository,
 } from "./persistence/ToolExecutionRepository";
@@ -21,6 +22,37 @@ export function classifyToolEffect(toolName: string): ToolEffectClass {
 
 export function hashToolInput(input: unknown): string {
   return createHash("sha256").update(canonicalJson(input)).digest("hex");
+}
+
+export function matchPendingApprovalToolCallIds(
+  durableCalls: readonly ToolExecutionRecord[],
+  actions: readonly {
+    name: string;
+    args: Record<string, unknown>;
+  }[],
+): string[] {
+  const used = new Set<string>();
+  const pendingCalls = durableCalls.filter(
+    (toolCall) =>
+      toolCall.status === "requested" ||
+      toolCall.status === "waiting_approval",
+  );
+  return actions.map((action) => {
+    const inputHash = hashToolInput(action.args);
+    for (const toolCall of pendingCalls) {
+      if (
+        !used.has(toolCall.toolCallId) &&
+        toolCall.toolName === action.name &&
+        toolCall.inputHash === inputHash
+      ) {
+        used.add(toolCall.toolCallId);
+        return toolCall.toolCallId;
+      }
+    }
+    throw new Error(
+      `Could not correlate approval action "${action.name}" with a pending durable tool call.`,
+    );
+  });
 }
 
 export function createToolExecutionLedgerMiddleware(input: {

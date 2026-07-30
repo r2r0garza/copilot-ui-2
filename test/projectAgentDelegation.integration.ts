@@ -139,24 +139,25 @@ async function main(): Promise<void> {
   });
 
   assert.deepEqual(
-    requests[0]?.tools?.map((tool) => tool.name),
-    ["task"],
-    "the parent should expose task and no unrelated tools",
+    requests[0]?.tools?.map((tool) => tool.name).sort(),
+    ["glob", "grep", "ls", "read_file", "task", "write_todos"],
+    "the parent should expose the universal baseline and task",
   );
+  const taskTool = requests[0]?.tools?.find((tool) => tool.name === "task");
   assert.match(
-    JSON.stringify(requests[0]?.tools?.[0]),
+    JSON.stringify(taskTool),
     /reader-child/,
     "the task schema should advertise the allowed child",
   );
   assert.doesNotMatch(
-    JSON.stringify(requests[0]?.tools?.[0]),
+    JSON.stringify(taskTool),
     /general-purpose/,
     "the implicit general-purpose child must not be exposed",
   );
   assert.deepEqual(
     requests[1]?.tools?.map((tool) => tool.name).sort(),
-    ["ls", "read_file"],
-    "the delegated child should receive only its own resolved tools",
+    ["glob", "grep", "ls", "read_file", "write_todos"],
+    "the delegated child should receive the universal baseline",
   );
   assert.equal(requests[2]?.tools?.some((tool) => tool.name === "task"), false);
   assert.deepEqual(

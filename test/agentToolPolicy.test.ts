@@ -1,19 +1,22 @@
 import assert from "node:assert/strict";
 import {
+  BASELINE_AGENT_TOOLS,
   renderAgentToolCapabilityPrompt,
   renderAgentToolPolicyBlock,
   resolveAgentToolPolicy,
 } from "../src/agentToolPolicy";
 
 function main(): void {
+  const baseline = [...BASELINE_AGENT_TOOLS].sort();
   const omitted = resolveAgentToolPolicy(undefined);
   assert.equal(omitted.mode, "none");
-  assert.deepEqual(omitted.resolvedTools, []);
-  assert.equal(omitted.allows("read_file"), false);
+  assert.deepEqual(omitted.resolvedTools, baseline);
+  assert.equal(omitted.allows("read_file"), true);
+  assert.equal(omitted.allows("write_todos"), true);
 
   const empty = resolveAgentToolPolicy([]);
   assert.equal(empty.mode, "none");
-  assert.deepEqual(empty.resolvedTools, []);
+  assert.deepEqual(empty.resolvedTools, baseline);
 
   const wildcard = resolveAgentToolPolicy(["*"]);
   assert.equal(wildcard.mode, "all");
@@ -66,6 +69,7 @@ function main(): void {
     "task",
     "web/fetch",
     "write_file",
+    "write_todos",
   ]);
 
   const mcp = resolveAgentToolPolicy(
@@ -74,7 +78,12 @@ function main(): void {
   );
   assert.deepEqual(mcp.resolvedTools, [
     "GitHub/create_issue",
+    "glob",
+    "grep",
+    "ls",
     "playwright-mcp/*",
+    "read_file",
+    "write_todos",
   ]);
   assert.equal(mcp.allows("playwright-mcp/browser_click"), true);
   assert.equal(mcp.allows("GitHub/create_issue"), true);
@@ -88,7 +97,7 @@ function main(): void {
     unknown.diagnostics.map((diagnostic) => diagnostic.code),
     ["tools.unknown-mcp-server", "tools.unknown"],
   );
-  assert.deepEqual(unknown.resolvedTools, []);
+  assert.deepEqual(unknown.resolvedTools, baseline);
 
   const capabilityPrompt = renderAgentToolCapabilityPrompt(
     granular,
@@ -103,15 +112,17 @@ function main(): void {
 
   const noToolsPrompt = renderAgentToolCapabilityPrompt(omitted, []);
   assert.match(noToolsPrompt, /Tools exposed for this model call: none/);
-  assert.match(noToolsPrompt, /selected agent has no usable tools/);
 
   const policyBlock = renderAgentToolPolicyBlock("write_file", omitted);
   assert.match(policyBlock, /was not executed/);
-  assert.match(policyBlock, /Configured capabilities for this agent: none/);
+  assert.match(
+    policyBlock,
+    /Configured capabilities for this agent: glob, grep, ls, read_file, write_todos/,
+  );
   assert.match(policyBlock, /Do not retry/);
 
   console.log(
-    "Agent tool policy test passed: fail-closed defaults, aliases, granular tools, MCP selectors, capability guidance, and diagnostics",
+    "Agent tool policy test passed: baseline tools, aliases, granular tools, MCP selectors, capability guidance, and diagnostics",
   );
 }
 

@@ -140,6 +140,26 @@ async function main(): Promise<void> {
     assert.match(String(staleResult.content), /read_file.*again/i);
     assert.equal(await readFile(shared, "utf8"), "changed");
 
+    const browserApprovalError = await coordinator.reserveApproval(
+      "run-browser",
+      [{
+        toolCallId: "browser-click",
+        name: "click_element",
+        args: {
+          pageId: "page-1",
+          element: "Increment",
+          ref: "e1",
+        },
+      }],
+      hooks(),
+    );
+    assert.equal(browserApprovalError, undefined);
+    coordinator.resolveApproval(
+      "run-browser",
+      ["browser-click"],
+      true,
+    );
+
     const approvalExpired: string[] = [];
     const approvalHooks = hooks(approvalExpired);
     await coordinator.reserveApproval(

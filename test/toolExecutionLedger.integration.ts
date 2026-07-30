@@ -17,6 +17,7 @@ import {
   classifyToolEffect,
   createToolExecutionLedgerMiddleware,
   hashToolInput,
+  matchPendingApprovalToolCallIds,
 } from "../src/toolExecutionLedger";
 
 function uri(fsPath: string) {
@@ -54,6 +55,35 @@ async function main(): Promise<void> {
     assert.equal(
       hashToolInput({ first: 1, second: 2 }),
       hashToolInput({ second: 2, first: 1 }),
+    );
+    const repeatedEditArguments = {
+      file_path: "/fixture.txt",
+      old_string: "before",
+      new_string: "after",
+    };
+    for (const toolCallId of ["completed-edit", "pending-edit"]) {
+      service.toolExecutions.request({
+        runId,
+        toolCallId,
+        toolName: "edit_file",
+        arguments: repeatedEditArguments,
+        inputHash: hashToolInput(repeatedEditArguments),
+        effectClass: "non_idempotent",
+      });
+    }
+    service.toolExecutions.transition(
+      runId,
+      "completed-edit",
+      "succeeded",
+      { kind: "tool_message", content: "stale edit rejected" },
+    );
+    assert.deepEqual(
+      matchPendingApprovalToolCallIds(
+        service.toolExecutions.list(runId),
+        [{ name: "edit_file", args: repeatedEditArguments }],
+      ),
+      ["pending-edit"],
+      "approval correlation must ignore an earlier terminal call with identical input",
     );
 
     let readExecutions = 0;

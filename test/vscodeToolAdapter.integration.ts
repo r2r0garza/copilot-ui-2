@@ -89,19 +89,21 @@ async function main(): Promise<void> {
     .find((message) => AIMessage.isInstance(message));
 
   assert.deepEqual(
-    requests[0]?.options.tools?.map((candidate) => ({
-      name: candidate.name,
-      description: candidate.description,
-      inputSchema: candidate.inputSchema,
-    })),
+    requests[0]?.options.tools?.map((candidate) => candidate.name).sort(),
     [
-      {
-        name: "fixture_readOnly",
-        description: fixtureProvider.description,
-        inputSchema: fixtureProvider.inputSchema,
-      },
+      "fixture_readOnly",
+      "glob",
+      "grep",
+      "ls",
+      "read_file",
+      "write_todos",
     ],
   );
+  const fixtureTool = requests[0]?.options.tools?.find(
+    (candidate) => candidate.name === "fixture_readOnly",
+  );
+  assert.equal(fixtureTool?.description, fixtureProvider.description);
+  assert.deepEqual(fixtureTool?.inputSchema, fixtureProvider.inputSchema);
   assert.deepEqual(providerInvocations.map(({ name, input }) => ({ name, input })), [
     {
       name: "fixture_readOnly",
@@ -133,7 +135,10 @@ async function main(): Promise<void> {
   await deniedAgent.invoke({
     messages: [{ role: "user", content: "Force the fixture call." }],
   });
-  assert.deepEqual(deniedRequests[0]?.options.tools, []);
+  assert.deepEqual(
+    deniedRequests[0]?.options.tools?.map((candidate) => candidate.name).sort(),
+    ["glob", "grep", "ls", "read_file", "write_todos"],
+  );
   assert.equal(
     providerInvocations.length,
     1,
