@@ -33,6 +33,7 @@ async function main(): Promise<void> {
   await writeFile(join(root, "fixture.txt"), "delegated fixture\n");
 
   const requests: vscode.LanguageModelChatRequestOptions[] = [];
+  const modelMessages: vscode.LanguageModelChatMessage[][] = [];
   const events: AdapterEvent[] = [];
   let requestCount = 0;
   const fakeModel = {
@@ -46,9 +47,10 @@ async function main(): Promise<void> {
       return 1;
     },
     async sendRequest(
-      _messages: vscode.LanguageModelChatMessage[],
+      messages: vscode.LanguageModelChatMessage[],
       options: vscode.LanguageModelChatRequestOptions = {},
     ) {
+      modelMessages.push(messages);
       requests.push(options);
       requestCount += 1;
       const turn = requestCount;
@@ -56,20 +58,34 @@ async function main(): Promise<void> {
         stream: (async function* () {
           if (turn === 1) {
             yield new vscode.LanguageModelToolCallPart(
-              "delegate-allowed",
+              "delegate-allowed-a",
               "task",
               {
-                description: "Read /fixture.txt and report its contents.",
+                description: "Read /fixture.txt for report A.",
+                subagent_type: "reader-child",
+              },
+            );
+            yield new vscode.LanguageModelToolCallPart(
+              "delegate-allowed-b",
+              "task",
+              {
+                description: "Read /fixture.txt for report B.",
                 subagent_type: "reader-child",
               },
             );
           } else if (turn === 2) {
             yield new vscode.LanguageModelToolCallPart(
-              "child-read",
+              "child-read-a",
               "read_file",
               { file_path: "/fixture.txt" },
             );
           } else if (turn === 3) {
+            yield new vscode.LanguageModelToolCallPart(
+              "child-read-b",
+              "read_file",
+              { file_path: "/fixture.txt" },
+            );
+          } else if (turn === 4 || turn === 5) {
             yield new vscode.LanguageModelTextPart(
               "reader-child-result: delegated fixture",
             );
@@ -87,14 +103,21 @@ async function main(): Promise<void> {
     model: fakeModel,
     onEvent: (event) => events.push(event),
   });
+  const childPrompts: string[] = [];
+  const childInternalEvents: AdapterEvent[] = [];
+  const childAdapter = adapter.fork({
+    emitEvents: false,
+    onInternalEvent: (event) => childInternalEvents.push(event),
+    onPrompt: ({ systemPrompt }) => childPrompts.push(systemPrompt),
+  });
   const backend = new FilesystemBackend({ rootDir: root, virtualMode: true });
   const child = createDeepAgent({
-    model: adapter,
+    model: childAdapter,
     name: "reader-child",
     backend,
     middleware: [
       createSubAgentMiddleware({
-        defaultModel: adapter,
+        defaultModel: childAdapter,
         subagents: [],
         generalPurposeAgent: false,
         systemPrompt: PROJECT_AGENT_DELEGATION_SYSTEM_PROMPT,
@@ -159,14 +182,54 @@ async function main(): Promise<void> {
     ["glob", "grep", "ls", "read_file", "write_todos"],
     "the delegated child should receive the universal baseline",
   );
+  assert.deepEqual(
+    requests[2]?.tools?.map((tool) => tool.name).sort(),
+    ["glob", "grep", "ls", "read_file", "write_todos"],
+    "parallel invocations of the delegated child should remain independently bounded",
+  );
   assert.equal(requests[2]?.tools?.some((tool) => tool.name === "task"), false);
   assert.deepEqual(
     events
       .filter((event) => event.kind === "toolCall")
       .map((event) => event.name),
-    ["task", "read_file"],
-    "delegation and child activity should both remain visible to the shared event ledger",
+    ["task", "task"],
+    "only the owner's parallel task calls should be visible; child tool activity must remain isolated",
   );
+  assert.deepEqual(
+    events
+      .filter((event) => event.kind === "toolResult")
+      .map((event) => event.id)
+      .sort(),
+    ["delegate-allowed-a", "delegate-allowed-b"],
+    "the final task result should remain visible without exposing the child's internal tool result",
+  );
+  assert.deepEqual(
+    events
+      .filter((event) => event.kind === "text")
+      .map((event) => event.text),
+    ["parent-result: reader-child-result"],
+    "child response text must not stream into the owner transcript",
+  );
+  assert.ok(
+    childPrompts.some((prompt) =>
+      prompt.includes("bounded reader child")
+    ),
+    "isolated child model calls should remain observable through prompt logging",
+  );
+  assert.deepEqual(
+    childInternalEvents
+      .filter((event) => event.kind === "toolCall")
+      .map((event) => event.name),
+    ["read_file", "read_file"],
+    "child events should remain available to an internal-only observer",
+  );
+  const parentReconciliationHistory = JSON.stringify(
+    modelMessages[modelMessages.length - 1] ?? [],
+  );
+  assert.match(parentReconciliationHistory, /delegate-allowed-a/);
+  assert.match(parentReconciliationHistory, /delegate-allowed-b/);
+  assert.doesNotMatch(parentReconciliationHistory, /child-read-a/);
+  assert.doesNotMatch(parentReconciliationHistory, /child-read-b/);
 
   const forcedRequests: vscode.LanguageModelChatMessage[][] = [];
   let forcedTurn = 0;
@@ -281,9 +344,14 @@ async function main(): Promise<void> {
       };
     },
   } as vscode.LanguageModelChat;
+  const approvalEvents: AdapterEvent[] = [];
   const approvalAdapter = new VsCodeChatModel({
     model: approvalModel,
-    onEvent: (event) => {
+    onEvent: (event) => approvalEvents.push(event),
+  });
+  const approvalChildAdapter = approvalAdapter.fork({
+    emitEvents: false,
+    onInternalEvent: (event) => {
       if (event.kind !== "toolCall") {
         return;
       }
@@ -298,11 +366,11 @@ async function main(): Promise<void> {
     },
   });
   const writerChild = createDeepAgent({
-    model: approvalAdapter,
+    model: approvalChildAdapter,
     backend,
     middleware: [
       createSubAgentMiddleware({
-        defaultModel: approvalAdapter,
+        defaultModel: approvalChildAdapter,
         subagents: [],
         generalPurposeAgent: false,
         systemPrompt: PROJECT_AGENT_DELEGATION_SYSTEM_PROMPT,
@@ -363,6 +431,13 @@ async function main(): Promise<void> {
     approvalWrite.status,
     "requested",
     "the production ledger must preserve an approval interrupt as resumable control flow",
+  );
+  assert.deepEqual(
+    approvalEvents
+      .filter((event) => event.kind === "toolCall")
+      .map((event) => event.name),
+    ["task"],
+    "a child approval interrupt must surface without exposing the child write call as a transcript event",
   );
   approvalPersistence.toolExecutions.transition(
     approvalRunId,

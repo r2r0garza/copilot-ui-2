@@ -892,6 +892,7 @@ class DeepAgentsChatPanel {
 
     const agent = this.createAgent(
       adapter,
+      model,
       session,
       runId,
       selectedAgent,
@@ -1116,6 +1117,7 @@ class DeepAgentsChatPanel {
       });
       const agent = this.createAgent(
         adapter,
+        model,
         session,
         runId,
         selectedAgent,
@@ -1332,6 +1334,7 @@ class DeepAgentsChatPanel {
 
   private createAgent(
     adapter: VsCodeChatModel,
+    model: vscode.LanguageModelChat,
     session: ChatSession,
     runId: string,
     agentDefinition: ProjectAgentDefinition,
@@ -1341,19 +1344,34 @@ class DeepAgentsChatPanel {
       agentDefinition,
       this.customizations,
     );
-    const subagents: CompiledSubAgent[] = delegation.children.map((child) => ({
-      name: child.id,
-      description: child.description ?? child.name,
-      runnable: this.createProjectAgentRuntime(
-        adapter,
-        session,
-        runId,
-        child,
-        [],
-        false,
-        undefined,
-      ),
-    }));
+    const subagents: CompiledSubAgent[] = delegation.children.map((child) => {
+      const childAdapter = adapter.fork({
+        emitEvents: false,
+        onInternalEvent: (event) =>
+          this.recordIsolatedChildAdapterEvent(event, runId),
+        onPrompt: (snapshot) =>
+          this.logModelPrompt(
+            snapshot,
+            runId,
+            session,
+            child.id,
+            model,
+          ),
+      });
+      return {
+        name: child.id,
+        description: child.description ?? child.name,
+        runnable: this.createProjectAgentRuntime(
+          childAdapter,
+          session,
+          runId,
+          child,
+          [],
+          false,
+          undefined,
+        ),
+      };
+    });
     return this.createProjectAgentRuntime(
       adapter,
       session,
@@ -2062,6 +2080,24 @@ class DeepAgentsChatPanel {
               : "Completed tool call",
       });
     }
+  }
+
+  private recordIsolatedChildAdapterEvent(
+    event: AdapterEvent,
+    runId: string,
+  ): void {
+    if (event.kind !== "toolCall") {
+      return;
+    }
+    const input = toRecord(event.input);
+    this.persistence.toolExecutions.request({
+      runId,
+      toolCallId: event.id,
+      toolName: event.name,
+      arguments: input,
+      inputHash: hashToolInput(input),
+      effectClass: classifyToolEffect(event.name),
+    });
   }
 
   private async post(message: Record<string, unknown>): Promise<void> {

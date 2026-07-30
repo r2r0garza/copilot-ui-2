@@ -122,6 +122,37 @@ async function main(): Promise<void> {
   );
   assert.ok(final && String(final.content).includes("adapter integration works"));
 
+  const isolatedPrompts: Array<{
+    systemPrompt: string;
+    userPrompt: string;
+  }> = [];
+  const isolatedAdapter = adapter.fork({
+    emitEvents: false,
+    onPrompt: (snapshot) => isolatedPrompts.push(snapshot),
+  });
+  const eventCountBeforeIsolatedRun = events.length;
+  await createDeepAgent({
+    model: isolatedAdapter,
+    backend: new FilesystemBackend({ rootDir: root, virtualMode: true }),
+    systemPrompt: configureDeepAgentSystemPrompt(
+      "This is an isolated child model call.",
+      false,
+    ),
+  }).invoke({
+    messages: [{ role: "user", content: "Return silently." }],
+  });
+  assert.equal(
+    events.length,
+    eventCountBeforeIsolatedRun,
+    "an isolated fork must not forward text or tool events to the owner adapter",
+  );
+  assert.equal(isolatedPrompts.length, 1);
+  assert.match(
+    isolatedPrompts[0].systemPrompt,
+    /isolated child model call/,
+    "an isolated fork should retain independent prompt observability",
+  );
+
   console.log("Adapter integration test passed: vscode.lm tool call -> Deep Agents execution -> tool result -> final response");
 }
 

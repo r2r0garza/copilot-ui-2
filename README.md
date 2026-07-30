@@ -178,6 +178,8 @@ Delegated children:
 
 - Receive their own Markdown instructions, tool policy, and applicable project skills.
 - Never inherit broader tools from the parent.
+- Keep intermediate model text and tool activity out of the parent's transcript and conversation-event history; only the parent's `task` call and final child result are projected there.
+- Continue to surface child-triggered approvals, while retaining child tool execution results in the internal durable ledger.
 - May be hidden from the user selector with `user-invocable: false`.
 - Are excluded when `disable-model-invocation: true`.
 - Are resolved by stable file ID, not display name.
