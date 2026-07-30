@@ -8,7 +8,8 @@ export class ApprovalRepository {
   record(input: {
     id?: string; sessionId?: string | null; runId?: string | null;
     toolCallId?: string | null; toolName: string;
-    decision: "once" | "session" | "deny"; processInstanceId: string;
+    decision: "once" | "session" | "deny" | "auto";
+    processInstanceId: string;
   }): string {
     const id = input.id ?? randomUUID();
     this.database.prepare(`

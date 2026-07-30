@@ -29,9 +29,11 @@ import {
   createToolExecutionLedgerMiddleware,
   encodeToolResult,
   hashToolInput,
+  matchPendingApprovalToolCallIds,
 } from "./toolExecutionLedger";
 import {
   discoverProjectCustomizations,
+  resolveProjectAgentSkills,
   type ProjectAgentDefinition,
   type ProjectCustomizations,
 } from "./projectCustomizations";
@@ -43,12 +45,12 @@ import {
 import { ProjectAgentRegistry } from "./projectAgentRegistry";
 import {
   createProjectAgentDelegationGuardMiddleware,
-  PROJECT_AGENT_DELEGATION_SYSTEM_PROMPT,
-  PROJECT_AGENT_TASK_DESCRIPTION,
   resolveProjectAgentDelegation,
 } from "./projectAgentDelegation";
 import { configureDeepAgentSystemPrompt } from "./deepAgentSystemPrompt";
-import { createProjectSkillsMiddleware } from "./projectSkillsMiddleware";
+import {
+  createProjectAgentSystemPromptMiddleware,
+} from "./projectAgentSystemPrompt";
 import {
   renderRegisteredLanguageModelToolInventory,
   snapshotRegisteredLanguageModelTools,
@@ -63,6 +65,12 @@ import {
 } from "./vscodeWebBrowserTools";
 import { resolveComposerControlState } from "./composerState";
 import {
+  DEFAULT_EXECUTION_MODE,
+  isExecutionMode,
+  shouldAutoApprove,
+  type ExecutionMode,
+} from "./executionMode";
+import {
   createSteeringMiddleware,
   pendingSteeringEntriesFromEvents,
   SteeringQueue,
@@ -70,6 +78,7 @@ import {
   type SteeringInjection,
 } from "./steeringQueue";
 import { createRepeatedToolFailureMiddleware } from "./repeatedToolFailure";
+import { createRepeatedToolNonProgressMiddleware } from "./repeatedToolNonProgress";
 import {
   collectRuntimeDiagnostics,
   renderRuntimeDiagnostics,
@@ -78,6 +87,7 @@ import {
   WorkspaceMutationCoordinator,
   type MutationRunHooks,
 } from "./workspaceMutationCoordinator";
+import { renderMarkdown } from "./markdownRenderer";
 
 let currentPanel: DeepAgentsChatPanel | undefined;
 const processAllowedTools = new Map<string, Set<string>>();
@@ -360,8 +370,10 @@ interface ChatSession {
   title: string;
   selectedModelKey: string;
   selectedAgentId: string | null;
+  executionMode: ExecutionMode;
   transcript: Array<{ role: "user" | "assistant"; content: string }>;
   allowedTools: Set<string>;
+  emittedToolResultIds: Set<string>;
 }
 
 type ConversationRunPhase =
@@ -713,6 +725,14 @@ class DeepAgentsChatPanel {
       }
       return;
     }
+    if (
+      raw.type === "selectExecutionMode" &&
+      !this.isSessionBusy(this.activeSession.id)
+    ) {
+      this.activeSession.executionMode = raw.mode;
+      await this.postWorkbenchState(false);
+      return;
+    }
     if (raw.type === "newSession") {
       const session = createSession(
         this.persistence,
@@ -870,6 +890,7 @@ class DeepAgentsChatPanel {
     let streamedFinalText = "";
     const adapter = new VsCodeChatModel({
       model,
+      seenToolResults: session.emittedToolResultIds,
       onPrompt: (snapshot) =>
         this.logModelPrompt(
           snapshot,
@@ -889,6 +910,7 @@ class DeepAgentsChatPanel {
 
     const agent = this.createAgent(
       adapter,
+      model,
       session,
       runId,
       selectedAgent,
@@ -969,6 +991,7 @@ class DeepAgentsChatPanel {
         type: "runCompleted",
         sessionId: session.id,
         text: finalText,
+        html: renderMarkdown(finalText),
       });
     } catch (error) {
       const cancelled = controller.cancellation.signal.aborted;
@@ -1094,6 +1117,7 @@ class DeepAgentsChatPanel {
       let streamedFinalText = "";
       const adapter = new VsCodeChatModel({
         model,
+        seenToolResults: session.emittedToolResultIds,
         onPrompt: (snapshot) =>
           this.logModelPrompt(
             snapshot,
@@ -1112,6 +1136,7 @@ class DeepAgentsChatPanel {
       });
       const agent = this.createAgent(
         adapter,
+        model,
         session,
         runId,
         selectedAgent,
@@ -1219,6 +1244,7 @@ class DeepAgentsChatPanel {
         type: "runCompleted",
         sessionId: session.id,
         text: finalText,
+        html: renderMarkdown(finalText),
       });
     } catch (error) {
       const cancelled = controller?.cancellation.signal.aborted ?? false;
@@ -1327,6 +1353,7 @@ class DeepAgentsChatPanel {
 
   private createAgent(
     adapter: VsCodeChatModel,
+    model: vscode.LanguageModelChat,
     session: ChatSession,
     runId: string,
     agentDefinition: ProjectAgentDefinition,
@@ -1336,19 +1363,34 @@ class DeepAgentsChatPanel {
       agentDefinition,
       this.customizations,
     );
-    const subagents: CompiledSubAgent[] = delegation.children.map((child) => ({
-      name: child.id,
-      description: child.description ?? child.name,
-      runnable: this.createProjectAgentRuntime(
-        adapter,
-        session,
-        runId,
-        child,
-        [],
-        false,
-        undefined,
-      ),
-    }));
+    const subagents: CompiledSubAgent[] = delegation.children.map((child) => {
+      const childAdapter = adapter.fork({
+        emitEvents: false,
+        onInternalEvent: (event) =>
+          this.recordIsolatedChildAdapterEvent(event, runId),
+        onPrompt: (snapshot) =>
+          this.logModelPrompt(
+            snapshot,
+            runId,
+            session,
+            child.id,
+            model,
+          ),
+      });
+      return {
+        name: child.id,
+        description: child.description ?? child.name,
+        runnable: this.createProjectAgentRuntime(
+          childAdapter,
+          session,
+          runId,
+          child,
+          [],
+          false,
+          undefined,
+        ),
+      };
+    });
     return this.createProjectAgentRuntime(
       adapter,
       session,
@@ -1428,12 +1470,12 @@ class DeepAgentsChatPanel {
       }),
       middleware: [
         createRepeatedToolFailureMiddleware(),
+        createRepeatedToolNonProgressMiddleware(),
         createSubAgentMiddleware({
           defaultModel: adapter,
           subagents,
           generalPurposeAgent: false,
-          systemPrompt: PROJECT_AGENT_DELEGATION_SYSTEM_PROMPT,
-          taskDescription: PROJECT_AGENT_TASK_DESCRIPTION,
+          systemPrompt: null,
         }),
         createProjectAgentDelegationGuardMiddleware(
           subagents.map((subagent) => subagent.name),
@@ -1455,10 +1497,22 @@ class DeepAgentsChatPanel {
           policy,
           modelNameAliases,
         ),
-        createProjectSkillsMiddleware(
-          this.customizations.skills,
-          this.workspaceRoot,
-        ),
+        createProjectAgentSystemPromptMiddleware({
+          agentInstructions: agentDefinition.body,
+          includeDeepAgentCorePrompt:
+            INCLUDE_DEEPAGENTS_DEFAULT_SYSTEM_PROMPT,
+          policy,
+          subagents: subagents.map((subagent) => ({
+            name: subagent.name,
+            description: subagent.description,
+          })),
+          skills: resolveProjectAgentSkills(
+            agentDefinition,
+            this.customizations.skills,
+          ),
+          workspaceRoot: this.workspaceRoot,
+          modelNameAliases,
+        }),
         this.mutationCoordinator.createMiddleware({
           runId,
           hooks: this.mutationHooks(runController),
@@ -1491,8 +1545,8 @@ class DeepAgentsChatPanel {
         ...browserApprovalInterrupts,
       },
       systemPrompt: configureDeepAgentSystemPrompt(
-        agentDefinition.body,
-        INCLUDE_DEEPAGENTS_DEFAULT_SYSTEM_PROMPT,
+        "",
+        false,
       ),
     });
   }
@@ -1505,7 +1559,7 @@ class DeepAgentsChatPanel {
     model: vscode.LanguageModelChat,
   ): void {
     this.modelCallsOutput.appendLine(
-      `[${new Date().toISOString()}] run=${runId} session=${session.id} agent=${agentId} model=${modelKey(model)}`,
+      `[${new Date().toISOString()}] run=${runId} session=${session.id} agent=${agentId}${snapshot.purpose === "compaction" ? ":compaction" : ""} model=${modelKey(model)}`,
     );
     this.modelCallsOutput.appendLine("===== SYSTEM PROMPT =====");
     this.modelCallsOutput.appendLine(snapshot.systemPrompt);
@@ -1570,8 +1624,11 @@ class DeepAgentsChatPanel {
           message: freshnessError,
         }));
       } else {
-        this.persistence.runs.setExecutionStatus(runId, "waiting_approval");
-        this.setRunPhase(controller, "waiting_approval");
+        const automatic = shouldAutoApprove(session.executionMode);
+        if (!automatic) {
+          this.persistence.runs.setExecutionStatus(runId, "waiting_approval");
+          this.setRunPhase(controller, "waiting_approval");
+        }
         for (const toolCallId of approvalToolCallIds) {
           this.persistence.toolExecutions.transition(
             runId,
@@ -1579,15 +1636,20 @@ class DeepAgentsChatPanel {
             "waiting_approval",
           );
         }
-        const decision = await this.requestApproval(
-          actions,
-          approvalToolCallIds,
-          runId,
-          session.id,
-          controller,
-          presentation,
-        );
-        const approved = decision === "once" || decision === "session";
+        const decision = automatic
+          ? "auto"
+          : await this.requestApproval(
+              actions,
+              approvalToolCallIds,
+              runId,
+              session.id,
+              controller,
+              presentation,
+            );
+        const approved =
+          decision === "auto" ||
+          decision === "once" ||
+          decision === "session";
         this.mutationCoordinator.resolveApproval(
           runId,
           approvalToolCallIds,
@@ -1597,6 +1659,18 @@ class DeepAgentsChatPanel {
           for (const action of actions) {
             session.allowedTools.add(action.name);
           }
+        }
+        if (decision === "auto") {
+          actions.forEach((action, index) => {
+            this.persistence.approvals.record({
+              sessionId: session.id,
+              runId,
+              toolCallId: approvalToolCallIds[index],
+              toolName: action.name,
+              decision,
+              processInstanceId: this.processInstanceId,
+            });
+          });
         }
         decisions = actions.map(() =>
           approved
@@ -1778,24 +1852,10 @@ class DeepAgentsChatPanel {
     runId: string,
     actions: ApprovalAction[],
   ): string[] {
-    const used = new Set<string>();
-    const durableCalls = this.persistence.toolExecutions.list(runId);
-    return actions.map((action) => {
-      const inputHash = hashToolInput(action.args);
-      for (const toolCall of durableCalls) {
-        if (
-          !used.has(toolCall.toolCallId) &&
-          toolCall.toolName === action.name &&
-          toolCall.inputHash === inputHash
-        ) {
-          used.add(toolCall.toolCallId);
-          return toolCall.toolCallId;
-        }
-      }
-      throw new Error(
-        `Could not correlate approval action "${action.name}" with a durable tool call.`,
-      );
-    });
+    return matchPendingApprovalToolCallIds(
+      this.persistence.toolExecutions.list(runId),
+      actions,
+    );
   }
 
   private findPendingApprovalRequestId(
@@ -1915,6 +1975,10 @@ class DeepAgentsChatPanel {
           projectConversationEvents(
             this.persistence.conversationEvents.list(active.id),
           ),
+        ).map((item) =>
+          item.kind === "message" && item.role === "assistant"
+            ? { ...item, html: renderMarkdown(item.content) }
+            : item
         )
       : undefined;
     this.panel.title = active.title === "New chat" ? "Deep Agents Workbench" : active.title;
@@ -1926,6 +1990,9 @@ class DeepAgentsChatPanel {
       activeRunCount: this.occupiedRunSlots,
       maxActiveConversations: MAX_ACTIVE_CONVERSATIONS,
       liveDraft: activeRun?.liveDraft ?? "",
+      liveDraftHtml: activeRun?.liveDraft
+        ? renderMarkdown(activeRun.liveDraft)
+        : "",
       pendingApproval: activeRun?.pendingApproval
         ? {
             requestId: activeRun.pendingApproval.requestId,
@@ -1935,6 +2002,7 @@ class DeepAgentsChatPanel {
         : undefined,
       selectedModelKey: this.selectedModelKey,
       selectedAgentId: active.selectedAgentId,
+      executionMode: active.executionMode,
       agents: this.agentRegistry.listUserInvocable().map((agent) => ({
         id: agent.id,
         name: agent.name,
@@ -1980,6 +2048,8 @@ class DeepAgentsChatPanel {
         type: "textDelta",
         sessionId,
         text: event.text,
+        content: controller.liveDraft,
+        html: renderMarkdown(controller.liveDraft),
       });
     } else if (event.kind === "toolCall") {
       const input = toRecord(event.input);
@@ -2053,6 +2123,24 @@ class DeepAgentsChatPanel {
     }
   }
 
+  private recordIsolatedChildAdapterEvent(
+    event: AdapterEvent,
+    runId: string,
+  ): void {
+    if (event.kind !== "toolCall") {
+      return;
+    }
+    const input = toRecord(event.input);
+    this.persistence.toolExecutions.request({
+      runId,
+      toolCallId: event.id,
+      toolName: event.name,
+      arguments: input,
+      inputHash: hashToolInput(input),
+      effectClass: classifyToolEffect(event.name),
+    });
+  }
+
   private async post(message: Record<string, unknown>): Promise<void> {
     await this.panel.webview.postMessage(message);
   }
@@ -2066,6 +2154,7 @@ type WebviewMessage =
   | { type: "clear" }
   | { type: "selectModel"; modelKey: string }
   | { type: "selectAgent"; agentId: string }
+  | { type: "selectExecutionMode"; mode: ExecutionMode }
   | { type: "newSession" }
   | { type: "selectSession"; sessionId: string }
   | { type: "renameSession"; sessionId: string; title: string }
@@ -2121,6 +2210,9 @@ function isWebviewMessage(value: unknown): value is WebviewMessage {
   }
   if (type === "selectAgent") {
     return typeof (value as { agentId?: unknown }).agentId === "string";
+  }
+  if (type === "selectExecutionMode") {
+    return isExecutionMode((value as { mode?: unknown }).mode);
   }
   if (type === "selectSession" || type === "deleteSession") {
     return typeof (value as { sessionId?: unknown }).sessionId === "string";
@@ -2384,8 +2476,10 @@ function createSession(
     title: stored.title,
     selectedModelKey,
     selectedAgentId: null,
+    executionMode: DEFAULT_EXECUTION_MODE,
     transcript: [],
     allowedTools: allowedToolsForSession(processInstanceId, stored.id),
+    emittedToolResultIds: new Set(),
   };
 }
 
@@ -2394,28 +2488,36 @@ function loadSessions(
   fallbackModelKey: string,
   processInstanceId: string,
 ): ChatSession[] {
-  return persistence.sessions.list().map((session) => ({
-    id: session.id,
-    threadId: session.threadId,
-    title: session.title,
-    selectedModelKey: session.selectedModelKey ?? fallbackModelKey,
-    selectedAgentId: session.selectedAgentId,
-    transcript: persistence.conversationEvents
-      .list(session.id)
-      .filter(
-        (event) =>
-          event.eventType === "user_message" ||
-          event.eventType === "assistant_message",
-      )
-      .map((event) => ({
-        role:
-          event.eventType === "user_message"
-            ? ("user" as const)
-            : ("assistant" as const),
-        content: String(event.payload.content),
-      })),
-    allowedTools: allowedToolsForSession(processInstanceId, session.id),
-  }));
+  return persistence.sessions.list().map((session) => {
+    const events = persistence.conversationEvents.list(session.id);
+    return {
+      id: session.id,
+      threadId: session.threadId,
+      title: session.title,
+      selectedModelKey: session.selectedModelKey ?? fallbackModelKey,
+      selectedAgentId: session.selectedAgentId,
+      executionMode: DEFAULT_EXECUTION_MODE,
+      transcript: events
+        .filter(
+          (event) =>
+            event.eventType === "user_message" ||
+            event.eventType === "assistant_message",
+        )
+        .map((event) => ({
+          role:
+            event.eventType === "user_message"
+              ? ("user" as const)
+              : ("assistant" as const),
+          content: String(event.payload.content),
+        })),
+      allowedTools: allowedToolsForSession(processInstanceId, session.id),
+      emittedToolResultIds: new Set(
+        events
+          .filter((event) => event.eventType === "tool_result")
+          .map((event) => String(event.payload.toolCallId)),
+      ),
+    };
+  });
 }
 
 function allowedToolsForSession(
@@ -2674,6 +2776,69 @@ function renderWebview(
       overflow-wrap: anywhere;
       line-height: 1.45;
     }
+    .message.markdown {
+      white-space: normal;
+    }
+    .message.markdown > :first-child { margin-top: 0; }
+    .message.markdown > :last-child { margin-bottom: 0; }
+    .message.markdown p { margin: 0 0 .75em; }
+    .message.markdown h1,
+    .message.markdown h2,
+    .message.markdown h3,
+    .message.markdown h4,
+    .message.markdown h5,
+    .message.markdown h6 {
+      margin: 1em 0 .45em;
+      line-height: 1.25;
+    }
+    .message.markdown h1 { font-size: 1.5em; }
+    .message.markdown h2 { font-size: 1.3em; }
+    .message.markdown h3 { font-size: 1.15em; }
+    .message.markdown ul,
+    .message.markdown ol {
+      margin: .35em 0 .8em;
+      padding-left: 1.75em;
+    }
+    .message.markdown li + li { margin-top: .25em; }
+    .message.markdown pre {
+      max-width: 100%;
+      margin: .65em 0;
+      padding: 9px 10px;
+      overflow: auto;
+      white-space: pre;
+      background: var(--vscode-textCodeBlock-background);
+      border: 1px solid var(--vscode-widget-border);
+      border-radius: 4px;
+    }
+    .message.markdown code {
+      font-family: var(--vscode-editor-font-family);
+      font-size: .92em;
+    }
+    .message.markdown :not(pre) > code {
+      padding: .1em .3em;
+      background: var(--vscode-textCodeBlock-background);
+      border-radius: 3px;
+    }
+    .message.markdown blockquote {
+      margin: .65em 0;
+      padding-left: .85em;
+      color: var(--vscode-descriptionForeground);
+      border-left: 3px solid var(--vscode-textBlockQuote-border);
+    }
+    .message.markdown a {
+      color: var(--vscode-textLink-foreground);
+    }
+    .message.markdown table {
+      display: block;
+      max-width: 100%;
+      overflow: auto;
+      border-collapse: collapse;
+    }
+    .message.markdown th,
+    .message.markdown td {
+      padding: 5px 8px;
+      border: 1px solid var(--vscode-widget-border);
+    }
     .user {
       align-self: flex-end;
       background: var(--vscode-button-background);
@@ -2780,12 +2945,49 @@ function renderWebview(
     textarea:focus { outline: 1px solid var(--vscode-focusBorder); }
     .actions {
       display: flex;
+      flex-wrap: wrap;
       justify-content: space-between;
       align-items: center;
       gap: 8px;
       margin-top: 8px;
     }
-    .primary-actions { display: flex; gap: 8px; }
+    .primary-actions {
+      display: flex;
+      gap: 8px;
+      margin-left: auto;
+    }
+    .execution-modes {
+      display: inline-flex;
+      align-items: stretch;
+      border: 1px solid var(--vscode-button-border, var(--vscode-panel-border));
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .execution-mode {
+      min-width: 58px;
+      padding: 4px 8px;
+      border: 0;
+      border-right: 1px solid var(--vscode-button-border, var(--vscode-panel-border));
+      border-radius: 0;
+      color: var(--vscode-button-secondaryForeground);
+      background: var(--vscode-button-secondaryBackground);
+    }
+    .execution-mode:last-child { border-right: 0; }
+    .execution-mode[aria-pressed="true"] {
+      color: var(--vscode-button-foreground);
+      background: var(--vscode-button-background);
+    }
+    .execution-mode.auto[aria-pressed="true"] {
+      color: var(--vscode-inputValidation-warningForeground, var(--vscode-button-foreground));
+      background: var(--vscode-inputValidation-warningBackground);
+      box-shadow: inset 0 0 0 1px var(--vscode-inputValidation-warningBorder);
+    }
+    .execution-mode:focus-visible {
+      position: relative;
+      z-index: 1;
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: -1px;
+    }
     #primary-action {
       width: 34px;
       height: 30px;
@@ -2844,6 +3046,27 @@ function renderWebview(
             <select id="model-select" aria-label="Language model"></select>
           </div>
           <div class="primary-actions">
+            <div
+              id="execution-modes"
+              class="execution-modes"
+              role="group"
+              aria-label="Execution mode"
+            >
+              <button
+                class="execution-mode"
+                type="button"
+                data-mode="default"
+                title="Ask for approval before protected operations"
+                aria-pressed="true"
+              >Default</button>
+              <button
+                class="execution-mode auto"
+                type="button"
+                data-mode="auto"
+                title="Automatically approve capabilities available to this agent"
+                aria-pressed="false"
+              >Auto</button>
+            </div>
             <button id="primary-action" type="submit" title="Send message" aria-label="Send message">
               <span aria-hidden="true">→</span>
             </button>
@@ -2863,6 +3086,10 @@ function renderWebview(
     const sessionList = document.getElementById("session-list");
     const agentSelect = document.getElementById("agent-select");
     const modelSelect = document.getElementById("model-select");
+    const executionModes = document.getElementById("execution-modes");
+    const executionModeButtons = Array.from(
+      executionModes.querySelectorAll("[data-mode]"),
+    );
     const subtitle = document.getElementById("subtitle");
     let draft = null;
     let running = false;
@@ -2885,11 +3112,22 @@ function renderWebview(
       return state;
     }
 
-    function addMessage(role, text) {
+    function setMessageContent(element, role, text, html) {
+      element.dataset.rawText = text;
+      if (role === "assistant" && typeof html === "string") {
+        element.classList.add("markdown");
+        element.innerHTML = html;
+      } else {
+        element.classList.remove("markdown");
+        element.textContent = text;
+      }
+    }
+
+    function addMessage(role, text, html) {
       document.getElementById("empty")?.remove();
       const element = document.createElement("div");
       element.className = "message " + role;
-      element.textContent = text;
+      setMessageContent(element, role, text, html);
       messages.appendChild(element);
       messages.scrollTop = messages.scrollHeight;
       return element;
@@ -3044,7 +3282,7 @@ function renderWebview(
       }
       for (const item of replayItems) {
         if (item.kind === "message") {
-          addMessage(item.role, item.content);
+          addMessage(item.role, item.content, item.html);
         } else if (item.kind === "steering_message") {
           addSteeringMessage(item.steeringId, item.content, item.status);
         } else if (item.kind === "tool_call") {
@@ -3281,6 +3519,15 @@ function renderWebview(
       updateComposerControl();
     }
 
+    function renderExecutionMode(executionMode) {
+      for (const button of executionModeButtons) {
+        button.setAttribute(
+          "aria-pressed",
+          String(button.dataset.mode === executionMode),
+        );
+      }
+    }
+
     function setRunning(value) {
       running = value;
       updateComposerControl();
@@ -3288,6 +3535,9 @@ function renderWebview(
       newChat.disabled = false;
       agentSelect.disabled = value;
       modelSelect.disabled = value;
+      for (const button of executionModeButtons) {
+        button.disabled = value;
+      }
       if (!value) prompt.focus();
     }
 
@@ -3337,6 +3587,31 @@ function renderWebview(
         });
       }
     });
+    executionModes.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-mode]");
+      if (!running && button && !button.disabled) {
+        vscode.postMessage({
+          type: "selectExecutionMode",
+          mode: button.dataset.mode,
+        });
+      }
+    });
+    executionModes.addEventListener("keydown", (event) => {
+      if (
+        running ||
+        (event.key !== "ArrowLeft" && event.key !== "ArrowRight")
+      ) {
+        return;
+      }
+      const enabled = executionModeButtons.filter((button) => !button.disabled);
+      const current = enabled.indexOf(document.activeElement);
+      if (current < 0) return;
+      event.preventDefault();
+      const direction = event.key === "ArrowRight" ? 1 : -1;
+      const next = enabled[(current + direction + enabled.length) % enabled.length];
+      next.focus();
+      next.click();
+    });
 
     window.addEventListener("message", ({ data }) => {
       switch (data.type) {
@@ -3346,11 +3621,16 @@ function renderWebview(
           renderSessions(data.sessions);
           renderAgents(data.agents, data.selectedAgentId);
           renderModels(data.models, data.selectedModelKey);
+          renderExecutionMode(data.executionMode);
           if (data.replaceMessages) {
             replaceConversation(data.replayItems);
             renderRecoveries(data.recoveries);
             if (data.liveDraft) {
-              draft = addMessage("assistant", data.liveDraft);
+              draft = addMessage(
+                "assistant",
+                data.liveDraft,
+                data.liveDraftHtml,
+              );
             }
             if (data.pendingApproval) {
               addApproval(
@@ -3369,8 +3649,8 @@ function renderWebview(
           break;
         case "textDelta":
           if (data.sessionId !== currentSessionId) break;
-          if (!draft) draft = addMessage("assistant", "");
-          draft.textContent += data.text;
+          if (!draft) draft = addMessage("assistant", "", "");
+          setMessageContent(draft, "assistant", data.content, data.html);
           messages.scrollTop = messages.scrollHeight;
           break;
         case "toolCall":
@@ -3426,7 +3706,11 @@ function renderWebview(
           break;
         case "runCompleted":
           if (data.sessionId !== currentSessionId) break;
-          if (!draft || draft.textContent !== data.text) addMessage("assistant", data.text);
+          if (!draft || draft.dataset.rawText !== data.text) {
+            addMessage("assistant", data.text, data.html);
+          } else {
+            setMessageContent(draft, "assistant", data.text, data.html);
+          }
           draft = null;
           setRunning(false);
           break;

@@ -2,11 +2,15 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { discoverProjectCustomizations } from "../src/projectCustomizations";
+import {
+  discoverProjectCustomizations,
+  resolveProjectAgentSkills,
+} from "../src/projectCustomizations";
 
 async function main(): Promise<void> {
   await discoversValidProjectCustomizations();
   await preservesOmittedAndEmptyToolLists();
+  await resolvesPerAgentSkillPolicies();
   await reportsInvalidCustomizationsWithoutFailingDiscovery();
   await handlesMissingGithubDirectory();
   await mergesMcpSourcesWithVsCodePrecedence();
@@ -26,6 +30,7 @@ async function discoversValidProjectCustomizations(): Promise<void> {
       "description: Researches a topic",
       "argument-hint: Describe the research question",
       "tools: [read, web]",
+      "skills: [citations]",
       "agents: reviewer",
       "user-invocable: false",
       "disable-model-invocation: true",
@@ -66,6 +71,7 @@ async function discoversValidProjectCustomizations(): Promise<void> {
     description: "Researches a topic",
     argumentHint: "Describe the research question",
     tools: ["read", "web"],
+    skills: ["citations"],
     agents: ["reviewer"],
     userInvocable: false,
     disableModelInvocation: true,
@@ -75,6 +81,7 @@ async function discoversValidProjectCustomizations(): Promise<void> {
       description: "Researches a topic",
       "argument-hint": "Describe the research question",
       tools: ["read", "web"],
+      skills: ["citations"],
       agents: "reviewer",
       "user-invocable": false,
       "disable-model-invocation": true,
@@ -128,6 +135,86 @@ async function preservesOmittedAndEmptyToolLists(): Promise<void> {
   );
 }
 
+async function resolvesPerAgentSkillPolicies(): Promise<void> {
+  const root = await createWorkspace();
+  for (const [directory, name] of [
+    ["alpha-directory", "alpha"],
+    ["different-directory", "renamed-skill"],
+  ]) {
+    await writeProjectFile(
+      root,
+      `.github/skills/${directory}/SKILL.md`,
+      [
+        "---",
+        `name: ${name}`,
+        `description: Guidance from ${name}`,
+        "---",
+        `Follow ${name}.`,
+      ].join("\n"),
+    );
+  }
+  for (const [id, skillsLine] of [
+    ["all", undefined],
+    ["none", "skills: []"],
+    ["selected", "skills: [RENAMED-SKILL, alpha, renamed-skill]"],
+    ["unknown", "skills: [missing-skill]"],
+  ] as const) {
+    await writeProjectFile(
+      root,
+      `.github/agents/${id}.agent.md`,
+      [
+        "---",
+        `name: ${id}`,
+        ...(skillsLine ? [skillsLine] : []),
+        "---",
+        `You are ${id}.`,
+      ].join("\n"),
+    );
+  }
+
+  const discovered = await discoverProjectCustomizations(root);
+  const agent = (id: string) => {
+    const value = discovered.agents.find((candidate) => candidate.id === id);
+    assert.ok(value);
+    return value;
+  };
+  assert.equal(agent("all").skills, undefined);
+  assert.deepEqual(agent("none").skills, []);
+  assert.deepEqual(
+    resolveProjectAgentSkills(agent("all"), discovered.skills).map(
+      (skill) => skill.name,
+    ),
+    ["alpha", "renamed-skill"],
+  );
+  assert.deepEqual(
+    resolveProjectAgentSkills(agent("none"), discovered.skills),
+    [],
+  );
+  assert.deepEqual(
+    resolveProjectAgentSkills(agent("selected"), discovered.skills).map(
+      (skill) => skill.name,
+    ),
+    ["renamed-skill", "alpha"],
+    "explicit policies should match frontmatter names case-insensitively, preserve declaration order, and deduplicate",
+  );
+  assert.deepEqual(
+    resolveProjectAgentSkills(agent("unknown"), discovered.skills),
+    [],
+  );
+  assert.deepEqual(
+    discovered.diagnostics.filter(
+      (diagnostic) => diagnostic.code === "agent.unknown-skill",
+    ),
+    [{
+      severity: "warning",
+      code: "agent.unknown-skill",
+      path: ".github/agents/unknown.agent.md",
+      message:
+        'Agent "unknown" declares unknown skill "missing-skill".',
+    }],
+  );
+}
+
 async function reportsInvalidCustomizationsWithoutFailingDiscovery(): Promise<void> {
   const root = await createWorkspace();
   await writeProjectFile(
@@ -155,6 +242,18 @@ async function reportsInvalidCustomizationsWithoutFailingDiscovery(): Promise<vo
       "  read: true",
       "---",
       "Must not receive all tools.",
+    ].join("\n"),
+  );
+  await writeProjectFile(
+    root,
+    ".github/agents/invalid-skills.agent.md",
+    [
+      "---",
+      "name: Invalid Skills",
+      "skills:",
+      "  code-review: true",
+      "---",
+      "Must not receive all skills.",
     ].join("\n"),
   );
   await writeProjectFile(

@@ -258,8 +258,15 @@ async function main(): Promise<void> {
     "mcp_playwright_browser_click",
   ]);
   assert.deepEqual(
-    allowedRequests[0]?.options.tools?.map((tool) => tool.name),
-    ["mcp_playwright_browser_click"],
+    allowedRequests[0]?.options.tools?.map((tool) => tool.name).sort(),
+    [
+      "glob",
+      "grep",
+      "ls",
+      "mcp_playwright_browser_click",
+      "read_file",
+      "write_todos",
+    ],
   );
   assert.match(
     JSON.stringify(allowedRequests[1]?.messages),

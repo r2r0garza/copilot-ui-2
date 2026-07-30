@@ -131,6 +131,24 @@ async function main(): Promise<void> {
       decision: "session",
       processInstanceId: "process-1",
     });
+    service.approvals.record({
+      sessionId: first.id,
+      runId,
+      toolCallId: "tool-auto",
+      toolName: "edit_file",
+      decision: "auto",
+      processInstanceId: "process-1",
+    });
+    assert.equal(
+      (
+        service.database.prepare(`
+          SELECT decision
+          FROM approval_decisions
+          WHERE tool_call_id = 'tool-auto'
+        `).get() as { decision: string }
+      ).decision,
+      "auto",
+    );
 
     const oldThread = service.sessions.clear(first.id, "thread-1-cleared");
     assert.equal(oldThread, "thread-1");
@@ -141,7 +159,7 @@ async function main(): Promise<void> {
       "copilot/model-a",
     );
     assert.equal(service.sessions.get(first.id)?.selectedAgentId, "coder");
-    assert.equal(service.approvals.countForSession(first.id), 1);
+    assert.equal(service.approvals.countForSession(first.id), 2);
     assert.equal(service.checkpointCleanup.list()[0].threadId, "thread-1");
 
     service.sessions.markDeletingAndQueue(first.id);

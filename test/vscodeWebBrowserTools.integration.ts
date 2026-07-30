@@ -254,8 +254,15 @@ async function main(): Promise<void> {
   });
   assert.deepEqual(providerInvocations, ["copilot_fetchWebPage"]);
   assert.deepEqual(
-    webRequests[0]?.options.tools?.map((tool) => tool.name),
-    ["copilot_fetchWebPage"],
+    webRequests[0]?.options.tools?.map((tool) => tool.name).sort(),
+    [
+      "copilot_fetchWebPage",
+      "glob",
+      "grep",
+      "ls",
+      "read_file",
+      "write_todos",
+    ],
   );
 
   const forcedRequests: ModelRequest[] = [];

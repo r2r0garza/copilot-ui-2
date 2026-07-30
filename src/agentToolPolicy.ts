@@ -1,6 +1,14 @@
 import { ToolMessage } from "@langchain/core/messages";
 import { createMiddleware } from "langchain";
 
+export const BASELINE_AGENT_TOOLS = [
+  "glob",
+  "grep",
+  "ls",
+  "read_file",
+  "write_todos",
+] as const;
+
 const CAPABILITY_TOOLS: Readonly<Record<string, readonly string[]>> = {
   read: ["ls", "read_file"],
   search: ["glob", "grep"],
@@ -62,7 +70,13 @@ export function resolveAgentToolPolicy(
 ): AgentToolPolicy {
   const normalizedConfigured = configuredTools?.map((tool) => tool.trim()) ?? [];
   if (normalizedConfigured.length === 0) {
-    return createPolicy("none", configuredTools, new Set(), [], []);
+    return createPolicy(
+      "none",
+      configuredTools,
+      new Set(BASELINE_AGENT_TOOLS),
+      [],
+      [],
+    );
   }
   if (normalizedConfigured.includes("*")) {
     return createPolicy("all", configuredTools, new Set(), [], []);
@@ -73,7 +87,7 @@ export function resolveAgentToolPolicy(
     mcpServers.set(serverName.toLocaleLowerCase(), serverName);
   }
 
-  const allowedTools = new Set<string>();
+  const allowedTools = new Set<string>(BASELINE_AGENT_TOOLS);
   const allowedPrefixes = new Set<string>();
   const diagnostics: AgentToolPolicyDiagnostic[] = [];
 

@@ -146,10 +146,13 @@ export class WorkspaceMutationCoordinator {
     actions: ApprovalMutationAction[],
     hooks: MutationRunHooks,
   ): Promise<string | undefined> {
-    if (actions.length === 0) {
+    const mutationActions = actions.filter((action) =>
+      MUTATION_TOOLS.has(action.name)
+    );
+    if (mutationActions.length === 0) {
       return undefined;
     }
-    const tickets = actions.map((action) =>
+    const tickets = mutationActions.map((action) =>
       this.enqueue(runId, action.toolCallId),
     );
     const first = tickets[0];
@@ -159,7 +162,7 @@ export class WorkspaceMutationCoordinator {
     }
     hooks.onRunning();
 
-    for (const action of actions) {
+    for (const action of mutationActions) {
       if (action.name === "execute_command") {
         continue;
       }
@@ -184,7 +187,7 @@ export class WorkspaceMutationCoordinator {
         ticket.expired = true;
       }
       this.releaseAll(tickets);
-      for (const action of actions) {
+      for (const action of mutationActions) {
         hooks.onApprovalExpired(action.toolCallId);
       }
     }, this.approvalReservationMs);

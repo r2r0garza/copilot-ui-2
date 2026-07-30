@@ -155,6 +155,10 @@ async function main(): Promise<void> {
           version: 4,
           name: "steering_conversation_events",
         },
+        {
+          version: 5,
+          name: "automatic_approval_decisions",
+        },
       ],
     );
     assert.throws(() => {
@@ -180,7 +184,7 @@ async function main(): Promise<void> {
           .prepare("SELECT COUNT(*) AS count FROM app_migrations")
           .get() as { count: number }
       ).count,
-      4,
+      5,
     );
     second.database
       .prepare(`

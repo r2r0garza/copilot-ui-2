@@ -19,6 +19,7 @@ export interface ProjectAgentDefinition {
   description?: string;
   argumentHint?: string;
   tools?: string[];
+  skills?: string[];
   agents?: string[];
   userInvocable: boolean;
   disableModelInvocation: boolean;
@@ -78,6 +79,7 @@ export async function discoverProjectCustomizations(
     join(githubRoot, "skills"),
     state,
   );
+  validateAgentSkillReferences(workspaceRoot, agents, skills, state);
   const mcp = await discoverMcp(
     workspaceRoot,
     join(githubRoot, "mcp.json"),
@@ -134,6 +136,12 @@ async function discoverAgents(
     const tools = optionalStringList(
       parsed.metadata.tools,
       "tools",
+      displayPath,
+      state,
+    );
+    const skills = optionalStringList(
+      parsed.metadata.skills,
+      "skills",
       displayPath,
       state,
     );
@@ -208,6 +216,7 @@ async function discoverAgents(
       ...(description !== undefined ? { description } : {}),
       ...(argumentHint !== undefined ? { argumentHint } : {}),
       ...(tools !== undefined ? { tools } : {}),
+      ...(skills !== undefined ? { skills } : {}),
       ...(allowedAgents !== undefined ? { agents: allowedAgents } : {}),
       userInvocable,
       disableModelInvocation,
@@ -301,6 +310,67 @@ async function discoverSkills(
   }
 
   return skills.sort((left, right) => left.name.localeCompare(right.name));
+}
+
+export function resolveProjectAgentSkills(
+  agent: Pick<ProjectAgentDefinition, "skills">,
+  availableSkills: readonly ProjectSkillDefinition[],
+): ProjectSkillDefinition[] {
+  if (agent.skills === undefined) {
+    return [...availableSkills];
+  }
+  const byName = new Map(
+    availableSkills.map((skill) => [
+      skill.name.toLocaleLowerCase(),
+      skill,
+    ]),
+  );
+  const resolved: ProjectSkillDefinition[] = [];
+  const seen = new Set<string>();
+  for (const configuredName of agent.skills) {
+    const normalizedName = configuredName.trim().toLocaleLowerCase();
+    if (!normalizedName || seen.has(normalizedName)) {
+      continue;
+    }
+    seen.add(normalizedName);
+    const skill = byName.get(normalizedName);
+    if (skill) {
+      resolved.push(skill);
+    }
+  }
+  return resolved;
+}
+
+function validateAgentSkillReferences(
+  workspaceRoot: string,
+  agents: readonly ProjectAgentDefinition[],
+  skills: readonly ProjectSkillDefinition[],
+  state: MutableDiscovery,
+): void {
+  const availableNames = new Set(
+    skills.map((skill) => skill.name.toLocaleLowerCase()),
+  );
+  for (const agent of agents) {
+    const seen = new Set<string>();
+    for (const configuredName of agent.skills ?? []) {
+      const normalizedName = configuredName.trim().toLocaleLowerCase();
+      if (
+        !normalizedName ||
+        seen.has(normalizedName) ||
+        availableNames.has(normalizedName)
+      ) {
+        continue;
+      }
+      seen.add(normalizedName);
+      addDiagnostic(
+        state,
+        "warning",
+        "agent.unknown-skill",
+        projectPath(workspaceRoot, agent.filePath),
+        `Agent "${agent.id}" declares unknown skill "${configuredName}".`,
+      );
+    }
+  }
 }
 
 async function discoverMcp(
