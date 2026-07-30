@@ -15,6 +15,7 @@ function skill(
   name: string,
 ): ProjectSkillDefinition {
   return {
+    scopePath: "",
     directoryPath: join(workspaceRoot, ".github", "skills", name),
     filePath: join(
       workspaceRoot,

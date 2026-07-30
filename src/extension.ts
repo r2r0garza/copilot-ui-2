@@ -33,6 +33,7 @@ import {
 } from "./toolExecutionLedger";
 import {
   discoverProjectCustomizations,
+  qualifiedSkillName,
   resolveProjectAgentSkills,
   type ProjectAgentDefinition,
   type ProjectCustomizations,
@@ -291,7 +292,9 @@ function renderProjectCustomizations(
   output.appendLine("");
   output.appendLine(`Skills (${discovered.skills.length})`);
   for (const skill of discovered.skills) {
-    output.appendLine(`- ${skill.name}: ${skill.description}`);
+    output.appendLine(
+      `- ${qualifiedSkillName(skill)}: ${skill.description}`,
+    );
   }
   output.appendLine("");
   output.appendLine(`MCP servers (${serverNames.length})`);
@@ -2005,7 +2008,9 @@ class DeepAgentsChatPanel {
       executionMode: active.executionMode,
       agents: this.agentRegistry.listUserInvocable().map((agent) => ({
         id: agent.id,
-        name: agent.name,
+        name: agent.scopePath
+          ? `${agent.name} — ${agent.scopePath}`
+          : agent.name,
         description: agent.description,
         argumentHint: agent.argumentHint,
       })),

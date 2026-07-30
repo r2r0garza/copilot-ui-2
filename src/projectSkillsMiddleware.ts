@@ -1,6 +1,7 @@
 import { relative } from "node:path";
 import { createMiddleware } from "langchain";
 import type { ProjectSkillDefinition } from "./projectCustomizations";
+import { qualifiedSkillName } from "./projectCustomizations";
 
 export function createProjectSkillsMiddleware(
   skills: readonly ProjectSkillDefinition[],
@@ -36,7 +37,7 @@ export function renderProjectSkillsPrompt(
         workspaceRoot,
         skill.filePath,
       ).replaceAll("\\", "/");
-      return `- ${skill.name}: ${skill.description} (/${projectRelativePath})`;
+      return `- ${qualifiedSkillName(skill)}: ${skill.description} (/${projectRelativePath})`;
     }),
     "",
     "When a user request matches a skill, read its SKILL.md with read_file before following it.",

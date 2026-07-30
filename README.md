@@ -58,11 +58,25 @@ The first model request or registered-provider invocation can show a VS Code con
 
 ## Project customizations
 
-Bridgit discovers customizations from the first workspace folder on every run. Use **Deep Agents: Inspect Project Customizations** to see the discovered definitions and warnings.
+Bridgit discovers customizations from the first workspace folder on every run.
+It reads both the workspace-root `.github` and nested `.github` directories,
+which allows repositories inside a monorepo or larger workspace to own agents
+and skills. Use **Deep Agents: Inspect Project Customizations** to see the
+discovered definitions, qualified names, and warnings.
+
+Recursive discovery does not enter dependency, generated-output, cache, or
+version-control directories such as `node_modules`, `.git`, `dist`, `build`,
+`out`, `target`, `vendor`, `.next`, or virtual-environment directories.
+Symbolic-link directories are not followed.
 
 ### Project agents
 
-Place agents in `.github/agents/*.agent.md`. The filename without `.agent.md` is the stable agent ID. A file contains YAML frontmatter followed by the agent's instruction body:
+Place agents in `.github/agents/*.agent.md` at the workspace root or within a
+nested customization scope such as `repo-1/.github/agents/*.agent.md`. Root
+agent IDs remain the filename without `.agent.md`. Nested IDs are qualified by
+the owning directory: `repo-1/.github/agents/tester.agent.md` has the stable ID
+`repo-1/tester`. A file contains YAML frontmatter followed by the agent's
+instruction body:
 
 ```md
 ---
@@ -85,9 +99,16 @@ Implement the smallest coherent change and report the verification performed.
 - `disable-model-invocation` defaults to `false`; `true` prevents another agent from delegating to it.
 - `tools` controls the agent's capabilities and is fail-closed.
 - `skills` controls which discovered project skills are available to the agent.
-- `agents` is the exact allowlist of child agent IDs available for delegation.
+- `agents` is the exact allowlist of child agent references available for
+  delegation. An unqualified reference resolves in the parent's nested scope
+  first and then falls back to the workspace root. Use a qualified ID such as
+  `repo-2/reviewer` for deliberate cross-scope delegation.
 
 New chats have no implicit project agent. The chosen agent and model are stored per chat. Agent instructions are wrapped as explicit custom instructions because VS Code's model API does not support system-role messages.
+
+The workbench selector labels nested agents with their owning scope, for
+example `Tester — repo-1`. Agents with the same display name may coexist in
+different scopes because their stable IDs remain distinct.
 
 ### Tool policy
 
@@ -113,7 +134,9 @@ succeeded.
 
 ### Project skills
 
-Place skills in `.github/skills/<directory>/SKILL.md`. Each skill requires non-empty `name` and `description` frontmatter plus an instruction body:
+Place skills in `.github/skills/<directory>/SKILL.md` at the workspace root or
+inside a nested customization scope. Each skill requires non-empty `name` and
+`description` frontmatter plus an instruction body:
 
 ```md
 ---
@@ -124,11 +147,15 @@ description: Review a selected change for correctness and test coverage.
 Inspect the requested change and recommend focused verification.
 ```
 
-An agent with no `skills` field receives all discovered skills. `skills: []`
-receives none, while `skills: [code-review, another-skill]` receives only those
-named skills. Skill names are matched case-insensitively against the `name` in
-`SKILL.md`; unknown names produce diagnostics and grant nothing. The same policy
-is resolved independently when the agent owns a conversation or runs as a child.
+An agent with no `skills` field receives every skill in its own scope plus
+workspace-root skills. A nested skill shadows a root skill with the same name.
+A root agent receives root skills only by default. `skills: []` receives none,
+while `skills: [code-review, another-skill]` receives only those named skills.
+Unqualified names resolve locally first and then at the root; qualified
+references such as `repo-2/code-review` deliberately select another scope.
+Skill names are matched case-insensitively against the `name` in `SKILL.md`;
+unknown names produce diagnostics and grant nothing. The same policy is
+resolved independently when the agent owns a conversation or runs as a child.
 
 Resolved skills refresh for existing checkpointed chats. Skills provide
 instructions only: they never expand the agent's tool policy or authorize side
@@ -136,7 +163,10 @@ effects.
 
 ### MCP servers
 
-Bridgit reads both `.github/mcp.json` and `.vscode/mcp.json`. A duplicate server in `.vscode/mcp.json` overrides the `.github` definition. Source-specific `transport` and `type` spellings are normalized during discovery.
+Bridgit reads the workspace-root `.github/mcp.json` and `.vscode/mcp.json`;
+nested MCP configuration is not part of recursive agent and skill discovery.
+A duplicate server in `.vscode/mcp.json` overrides the `.github` definition.
+Source-specific `transport` and `type` spellings are normalized during discovery.
 
 Configured servers are matched to currently registered VS Code language-model tools at runtime. Invalid, unsupported, unavailable, ambiguous, or untrusted providers are skipped with diagnostics; other valid servers remain usable. Start and trust the MCP server in VS Code, refresh its cached tools if needed, and inspect project customizations again.
 
@@ -182,7 +212,8 @@ Delegated children:
 - Continue to surface child-triggered approvals, while retaining child tool execution results in the internal durable ledger.
 - May be hidden from the user selector with `user-invocable: false`.
 - Are excluded when `disable-model-invocation: true`.
-- Are resolved by stable file ID, not display name.
+- Are resolved by stable scoped file ID, not display name. Unqualified child
+  references resolve locally first and then at the workspace root.
 
 Delegation is limited to one level. Unknown children, disabled children, direct or indirect cycles, and attempts to delegate beyond that depth produce explicit diagnostics or tool errors.
 

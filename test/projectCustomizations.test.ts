@@ -9,6 +9,7 @@ import {
 
 async function main(): Promise<void> {
   await discoversValidProjectCustomizations();
+  await discoversNestedCustomizationScopes();
   await preservesOmittedAndEmptyToolLists();
   await resolvesPerAgentSkillPolicies();
   await reportsInvalidCustomizationsWithoutFailingDiscovery();
@@ -17,6 +18,142 @@ async function main(): Promise<void> {
   console.log(
     "Project customization tests passed: agents, skills, MCP, semantics, and diagnostics",
   );
+}
+
+async function discoversNestedCustomizationScopes(): Promise<void> {
+  const root = await createWorkspace();
+  for (const [path, name, description] of [
+    [".github/skills/shared/SKILL.md", "shared", "Root shared guidance"],
+    [".github/skills/root-only/SKILL.md", "root-only", "Root-only guidance"],
+    [
+      "repo-1/.github/skills/shared/SKILL.md",
+      "shared",
+      "Repo-local shared guidance",
+    ],
+    [
+      "repo-1/.github/skills/local-only/SKILL.md",
+      "local-only",
+      "Repo-local guidance",
+    ],
+    [
+      "repo-2/.github/skills/sibling/SKILL.md",
+      "sibling",
+      "Sibling guidance",
+    ],
+    [
+      "node_modules/ignored/.github/skills/ignored/SKILL.md",
+      "ignored",
+      "Ignored dependency guidance",
+    ],
+    [
+      "dist/generated/.github/skills/generated/SKILL.md",
+      "generated",
+      "Ignored generated guidance",
+    ],
+  ]) {
+    await writeProjectFile(
+      root,
+      path,
+      [
+        "---",
+        `name: ${name}`,
+        `description: ${description}`,
+        "---",
+        `Follow ${description}.`,
+      ].join("\n"),
+    );
+  }
+  for (const [path, name, skills] of [
+    [".github/agents/reviewer.agent.md", "Reviewer", undefined],
+    ["repo-1/.github/agents/reviewer.agent.md", "Reviewer", undefined],
+    [
+      "repo-1/.github/agents/scoped.agent.md",
+      "Scoped",
+      "skills: [shared, repo-2/sibling, root-only]",
+    ],
+    [
+      "folder-name/module/.github/agents/tester.agent.md",
+      "Tester",
+      "skills: []",
+    ],
+    [
+      "node_modules/ignored/.github/agents/ignored.agent.md",
+      "Ignored",
+      undefined,
+    ],
+  ] as const) {
+    await writeProjectFile(
+      root,
+      path,
+      [
+        "---",
+        `name: ${name}`,
+        ...(skills ? [skills] : []),
+        "---",
+        `You are ${name}.`,
+      ].join("\n"),
+    );
+  }
+
+  const discovered = await discoverProjectCustomizations(root);
+  assert.deepEqual(
+    discovered.agents.map(({ id, scopePath }) => ({ id, scopePath })),
+    [
+      {
+        id: "folder-name/module/tester",
+        scopePath: "folder-name/module",
+      },
+      { id: "repo-1/reviewer", scopePath: "repo-1" },
+      { id: "repo-1/scoped", scopePath: "repo-1" },
+      { id: "reviewer", scopePath: "" },
+    ],
+    "root IDs remain stable while nested IDs are qualified by their owning directory",
+  );
+  assert.deepEqual(
+    discovered.skills.map((skill) => `${skill.scopePath}:${skill.name}`),
+    [
+      ":root-only",
+      ":shared",
+      "repo-1:local-only",
+      "repo-1:shared",
+      "repo-2:sibling",
+    ],
+    "dependency and generated directories must not contribute customization scopes",
+  );
+
+  const rootAgent = discovered.agents.find(({ id }) => id === "reviewer");
+  const nestedAgent = discovered.agents.find(
+    ({ id }) => id === "repo-1/reviewer",
+  );
+  const explicitlyScopedAgent = discovered.agents.find(
+    ({ id }) => id === "repo-1/scoped",
+  );
+  assert.ok(rootAgent);
+  assert.ok(nestedAgent);
+  assert.ok(explicitlyScopedAgent);
+  assert.deepEqual(
+    resolveProjectAgentSkills(rootAgent, discovered.skills).map(
+      (skill) => `${skill.scopePath}:${skill.name}`,
+    ),
+    [":root-only", ":shared"],
+    "a root agent receives root skills only by default",
+  );
+  assert.deepEqual(
+    resolveProjectAgentSkills(nestedAgent, discovered.skills).map(
+      (skill) => `${skill.scopePath}:${skill.name}`,
+    ),
+    ["repo-1:local-only", "repo-1:shared", ":root-only"],
+    "a nested agent receives local skills first, with root fallback and local name shadowing",
+  );
+  assert.deepEqual(
+    resolveProjectAgentSkills(
+      explicitlyScopedAgent,
+      discovered.skills,
+    ).map((skill) => `${skill.scopePath}:${skill.name}`),
+    ["repo-1:shared", "repo-2:sibling", ":root-only"],
+    "qualified skill references may deliberately cross scopes",
+  );
+  assert.deepEqual(discovered.diagnostics, []);
 }
 
 async function discoversValidProjectCustomizations(): Promise<void> {
@@ -66,6 +203,7 @@ async function discoversValidProjectCustomizations(): Promise<void> {
   assert.equal(discovered.agents.length, 1);
   assert.deepEqual(discovered.agents[0], {
     id: "researcher",
+    scopePath: "",
     filePath: join(root, ".github/agents/researcher.agent.md"),
     name: "Researcher",
     description: "Researches a topic",
