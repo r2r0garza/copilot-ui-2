@@ -29,6 +29,7 @@ const tests = [
   "repeatedToolFailure.integration",
   "sqliteCheckpointer.integration",
   "toolExecutionLedger.integration",
+  "workspaceMutationCoordinator.integration",
   "pendingApprovalRecovery.integration",
   "interruptedContinuation.integration",
   "futureGoal.integration",
