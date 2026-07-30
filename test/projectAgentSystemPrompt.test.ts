@@ -76,6 +76,11 @@ assert.match(
 );
 assert.doesNotMatch(delegationPrompt, /general-purpose/);
 
+assert.match(
+  readOnlyPrompt,
+  /Use `grep` within `\/large_tool_results\/` for targeted facts/,
+);
+
 console.log(
   "Project agent system prompt test passed: prompt sections match resolved capabilities",
 );

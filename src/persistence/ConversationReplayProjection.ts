@@ -134,6 +134,7 @@ export function projectConversationEvents(
     string,
     { toolName: string; label: string | null }
   >();
+  const completedToolCalls = new Set<string>();
   const approvalRequests = new Map<string, { toolName: string }>();
   const items: ConversationReplayItem[] = [];
 
@@ -161,6 +162,7 @@ export function projectConversationEvents(
         const toolName = stringValue(event.payload.toolName);
         const label = nullableString(event.payload.label);
         calls.set(toolCallId, { toolName, label });
+        completedToolCalls.delete(toolCallId);
         items.push({
           ...base,
           kind: "tool_call",
@@ -175,6 +177,10 @@ export function projectConversationEvents(
 
       case "tool_result": {
         const toolCallId = stringValue(event.payload.toolCallId);
+        if (completedToolCalls.has(toolCallId)) {
+          break;
+        }
+        completedToolCalls.add(toolCallId);
         const call = calls.get(toolCallId);
         const output = event.payload.output;
         items.push({

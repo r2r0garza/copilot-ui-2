@@ -259,9 +259,11 @@ function renderLargeToolResultsPrompt(canSearch: boolean): string {
     "Use the exact path from the replacement tool result and inspect it in chunks with `read_file`.",
     ...(canSearch
       ? [
-          "Use `grep` within `/large_tool_results/` when you need to search offloaded results and do not know the exact path.",
+          "Use `grep` within `/large_tool_results/` for targeted facts or structural markers instead of reading every chunk sequentially.",
+          "If you do not know the exact offloaded path, search across `/large_tool_results/`; if you do know it, scope the search to that result when possible.",
         ]
       : []),
+    "Stop reading once you have enough evidence for the requested output; do not exhaustively paginate unrelated content.",
   ].join("\n");
 }
 

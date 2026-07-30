@@ -20,6 +20,7 @@ export type AdapterEvent =
 export interface ModelPromptSnapshot {
   systemPrompt: string;
   userPrompt: string;
+  purpose: "agent" | "compaction";
 }
 
 interface VsCodeChatModelCallOptions extends BaseChatModelCallOptions {
@@ -155,8 +156,13 @@ export class VsCodeChatModel extends BaseChatModel<VsCodeChatModelCallOptions> {
     options: this["ParsedCallOptions"],
     runManager?: CallbackManagerForLLMRun,
   ): AsyncGenerator<ChatGenerationChunk> {
-    this.onPrompt?.(extractModelPromptSnapshot(messages));
-    const vscodeMessages = this.toVsCodeMessages(messages);
+    const snapshot = extractModelPromptSnapshot(messages);
+    this.onPrompt?.(snapshot);
+    const emitConversationEvents = snapshot.purpose === "agent";
+    const vscodeMessages = this.toVsCodeMessages(
+      messages,
+      emitConversationEvents,
+    );
     const tools = this.toVsCodeTools(options.tools ?? this.boundTools);
     const cancellation = this.createCancellation(options.signal);
 
@@ -177,19 +183,28 @@ export class VsCodeChatModel extends BaseChatModel<VsCodeChatModelCallOptions> {
       let toolIndex = 0;
       for await (const part of response.stream) {
         if (part instanceof vscode.LanguageModelTextPart) {
-          this.emitEvent({ kind: "text", text: part.value });
+          this.emitEvent(
+            { kind: "text", text: part.value },
+            emitConversationEvents,
+          );
           await runManager?.handleLLMNewToken(part.value);
           yield new ChatGenerationChunk({
             text: part.value,
             message: new AIMessageChunk({ content: part.value }),
           });
         } else if (part instanceof vscode.LanguageModelToolCallPart) {
-          this.emitEvent({
-            kind: "toolCall",
-            id: part.callId,
-            name: part.name,
-            input: part.input,
-          });
+          if (emitConversationEvents) {
+            this.seenToolResults.delete(part.callId);
+          }
+          this.emitEvent(
+            {
+              kind: "toolCall",
+              id: part.callId,
+              name: part.name,
+              input: part.input,
+            },
+            emitConversationEvents,
+          );
           yield new ChatGenerationChunk({
             text: "",
             message: new AIMessageChunk({
@@ -217,8 +232,13 @@ export class VsCodeChatModel extends BaseChatModel<VsCodeChatModelCallOptions> {
     options: this["ParsedCallOptions"],
     onText?: (text: string) => Promise<void>,
   ): Promise<ProviderResult> {
-    this.onPrompt?.(extractModelPromptSnapshot(messages));
-    const vscodeMessages = this.toVsCodeMessages(messages);
+    const snapshot = extractModelPromptSnapshot(messages);
+    this.onPrompt?.(snapshot);
+    const emitConversationEvents = snapshot.purpose === "agent";
+    const vscodeMessages = this.toVsCodeMessages(
+      messages,
+      emitConversationEvents,
+    );
     const tools = this.toVsCodeTools(options.tools ?? this.boundTools);
     const cancellation = this.createCancellation(options.signal);
 
@@ -241,17 +261,26 @@ export class VsCodeChatModel extends BaseChatModel<VsCodeChatModelCallOptions> {
       for await (const part of response.stream) {
         if (part instanceof vscode.LanguageModelTextPart) {
           text += part.value;
-          this.emitEvent({ kind: "text", text: part.value });
+          this.emitEvent(
+            { kind: "text", text: part.value },
+            emitConversationEvents,
+          );
           await onText?.(part.value);
         } else if (part instanceof vscode.LanguageModelToolCallPart) {
           const args = asRecord(part.input);
           toolCalls.push({ id: part.callId, name: part.name, args });
-          this.emitEvent({
-            kind: "toolCall",
-            id: part.callId,
-            name: part.name,
-            input: args,
-          });
+          if (emitConversationEvents) {
+            this.seenToolResults.delete(part.callId);
+          }
+          this.emitEvent(
+            {
+              kind: "toolCall",
+              id: part.callId,
+              name: part.name,
+              input: args,
+            },
+            emitConversationEvents,
+          );
         }
       }
       return { text, toolCalls };
@@ -260,7 +289,10 @@ export class VsCodeChatModel extends BaseChatModel<VsCodeChatModelCallOptions> {
     }
   }
 
-  private toVsCodeMessages(messages: BaseMessage[]): vscode.LanguageModelChatMessage[] {
+  private toVsCodeMessages(
+    messages: BaseMessage[],
+    emitConversationEvents: boolean,
+  ): vscode.LanguageModelChatMessage[] {
     const systemInstructions = messages
       .filter((message) => message.getType() === "system")
       .map((message) => contentToText(message.content))
@@ -288,7 +320,10 @@ export class VsCodeChatModel extends BaseChatModel<VsCodeChatModelCallOptions> {
       const text = contentToText(message.content);
 
       if (ToolMessage.isInstance(message)) {
-        if (!this.seenToolResults.has(message.tool_call_id)) {
+        if (
+          emitConversationEvents &&
+          !this.seenToolResults.has(message.tool_call_id)
+        ) {
           this.seenToolResults.add(message.tool_call_id);
           this.emitEvent({
             kind: "toolResult",
@@ -355,7 +390,13 @@ export class VsCodeChatModel extends BaseChatModel<VsCodeChatModelCallOptions> {
     }));
   }
 
-  private emitEvent(event: AdapterEvent): void {
+  private emitEvent(
+    event: AdapterEvent,
+    emitConversationEvent = true,
+  ): void {
+    if (!emitConversationEvent) {
+      return;
+    }
     this.onInternalEvent?.(event);
     if (this.emitEvents) {
       this.onEvent?.(event);
@@ -399,7 +440,23 @@ function extractModelPromptSnapshot(
       break;
     }
   }
-  return { systemPrompt, userPrompt };
+  return {
+    systemPrompt,
+    userPrompt,
+    purpose: isCompactionPrompt(userPrompt) ? "compaction" : "agent",
+  };
+}
+
+function isCompactionPrompt(prompt: string): boolean {
+  const normalized = prompt.trim();
+  return (
+    (normalized.startsWith("You are a conversation summarizer.") &&
+      normalized.includes("Conversation to summarize:") &&
+      normalized.endsWith("Summary:")) ||
+    (normalized.includes("Context Extraction Assistant") &&
+      normalized.includes("Messages to summarize:") &&
+      normalized.includes("Respond ONLY with the extracted context."))
+  );
 }
 
 function asRecord(input: object): Record<string, unknown> {

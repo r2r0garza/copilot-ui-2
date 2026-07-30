@@ -2,11 +2,18 @@ import assert from "node:assert/strict";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AIMessage } from "@langchain/core/messages";
-import { createDeepAgent, FilesystemBackend } from "deepagents";
+import { AIMessage, HumanMessage, ToolMessage } from "@langchain/core/messages";
+import {
+  createDeepAgent,
+  createSummarizationMiddleware,
+  FilesystemBackend,
+} from "deepagents";
 import * as vscode from "vscode";
 import { configureDeepAgentSystemPrompt } from "../src/deepAgentSystemPrompt";
-import { VsCodeChatModel } from "../src/vscodeChatModel";
+import {
+  VsCodeChatModel,
+  type ModelPromptSnapshot,
+} from "../src/vscodeChatModel";
 
 async function main(): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), "deepagents-vscode-spike-"));
@@ -52,10 +59,12 @@ async function main(): Promise<void> {
 
   const events: string[] = [];
   const prompts: Array<{ systemPrompt: string; userPrompt: string }> = [];
+  const seenToolResults = new Set<string>();
   const adapter = new VsCodeChatModel({
     model: fakeModel,
     onEvent: (event) => events.push(event.kind),
     onPrompt: (snapshot) => prompts.push(snapshot),
+    seenToolResults,
   });
   const agent = createDeepAgent({
     model: adapter,
@@ -103,6 +112,36 @@ async function main(): Promise<void> {
     "The Deep Agents system prompt should remain present after a tool result",
   );
   assert.deepEqual(events, ["toolCall", "toolResult", "text"]);
+  assert.deepEqual([...seenToolResults], ["read-fixture"]);
+
+  const replayEvents: string[] = [];
+  const replayAdapter = new VsCodeChatModel({
+    model: fakeModel,
+    seenToolResults,
+    onEvent: (event) => replayEvents.push(event.kind),
+  });
+  await replayAdapter.invoke([
+    new HumanMessage("Read /fixture.txt"),
+    new AIMessage({
+      content: "",
+      tool_calls: [{
+        id: "read-fixture",
+        name: "read_file",
+        args: { file_path: "/fixture.txt" },
+        type: "tool_call",
+      }],
+    }),
+    new ToolMessage({
+      content: "adapter integration works",
+      tool_call_id: "read-fixture",
+      name: "read_file",
+    }),
+  ]);
+  assert.deepEqual(
+    replayEvents,
+    ["text"],
+    "A new owner adapter must not re-emit a tool result already surfaced in this session.",
+  );
   assert.equal(prompts.length, 2);
   assert.ok(
     prompts.every(
@@ -151,6 +190,78 @@ async function main(): Promise<void> {
     isolatedPrompts[0].systemPrompt,
     /isolated child model call/,
     "an isolated fork should retain independent prompt observability",
+  );
+
+  const compactionEvents: string[] = [];
+  const compactionPrompts: ModelPromptSnapshot[] = [];
+  const compactionModel = {
+    ...fakeModel,
+    id: "compaction-fixture",
+    async sendRequest(
+      messages: vscode.LanguageModelChatMessage[],
+    ) {
+      const text = messages
+        .flatMap((message) => message.content)
+        .filter(
+          (part): part is vscode.LanguageModelTextPart =>
+            part instanceof vscode.LanguageModelTextPart,
+        )
+        .map((part) => part.value)
+        .join("\n");
+      return {
+        stream: (async function* () {
+          yield new vscode.LanguageModelTextPart(
+            text.includes("You are a conversation summarizer")
+              ? "INTERNAL COMPACTION SUMMARY"
+              : "Visible response after compaction.",
+          );
+        })(),
+        text: (async function* () {})(),
+      };
+    },
+  } as vscode.LanguageModelChat;
+  const visibleCompactionAdapter = new VsCodeChatModel({
+    model: compactionModel,
+    onEvent: (event) => {
+      if (event.kind === "text") compactionEvents.push(event.text);
+    },
+    onPrompt: (snapshot) => compactionPrompts.push(snapshot),
+  });
+  const compactionBackend = new FilesystemBackend({
+    rootDir: root,
+    virtualMode: true,
+  });
+  await createDeepAgent({
+    model: visibleCompactionAdapter,
+    backend: compactionBackend,
+    middleware: [
+      createSummarizationMiddleware({
+        model: visibleCompactionAdapter,
+        backend: compactionBackend,
+        trigger: { type: "messages", value: 2 },
+        keep: { type: "messages", value: 1 },
+      }),
+    ],
+  }).invoke({
+    messages: [
+      { role: "user", content: "Earlier context." },
+      { role: "assistant", content: "Earlier response." },
+      { role: "user", content: "Continue after compaction." },
+    ],
+  });
+  assert.deepEqual(
+    compactionEvents,
+    ["Visible response after compaction."],
+    "internal summary text must not be forwarded as conversation output",
+  );
+  const internalCompactionPrompt = compactionPrompts.find(
+    ({ purpose }) => purpose === "compaction",
+  );
+  assert.ok(internalCompactionPrompt);
+  assert.match(
+    internalCompactionPrompt.userPrompt,
+    /conversation summarizer/i,
+    "compaction should remain observable through its separately labeled prompt",
   );
 
   console.log("Adapter integration test passed: vscode.lm tool call -> Deep Agents execution -> tool result -> final response");

@@ -31,6 +31,8 @@ const tests = [
   "steeringQueue.integration",
   "repeatedToolFailure.test",
   "repeatedToolFailure.integration",
+  "repeatedToolNonProgress.test",
+  "repeatedToolNonProgress.integration",
   "sqliteCheckpointer.integration",
   "toolExecutionLedger.integration",
   "workspaceMutationCoordinator.integration",

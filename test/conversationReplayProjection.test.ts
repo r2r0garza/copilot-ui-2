@@ -238,6 +238,46 @@ assert.deepEqual(
   [8, 2, 1, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13],
 );
 
+const duplicateResults = projectConversationEvents([
+  event(1, "tool_call", {
+    schemaVersion: 1,
+    toolCallId: "reused-call",
+    toolName: "read_file",
+    input: { file_path: "/first.txt" },
+  }),
+  event(2, "tool_result", {
+    schemaVersion: 1,
+    toolCallId: "reused-call",
+    output: "first",
+  }),
+  event(3, "tool_result", {
+    schemaVersion: 1,
+    toolCallId: "reused-call",
+    output: "first",
+  }),
+  event(4, "tool_call", {
+    schemaVersion: 1,
+    toolCallId: "reused-call",
+    toolName: "read_file",
+    input: { file_path: "/second.txt" },
+  }),
+  event(5, "tool_result", {
+    schemaVersion: 1,
+    toolCallId: "reused-call",
+    output: "second",
+  }),
+]);
+assert.deepEqual(
+  byKind(duplicateResults, "tool_result").map(
+    ({ sequence, output }) => ({ sequence, output }),
+  ),
+  [
+    { sequence: 2, output: "first" },
+    { sequence: 5, output: "second" },
+  ],
+  "duplicate results without a new call are suppressed while an explicit call-ID reuse starts a new lifecycle",
+);
+
 console.log(
-  "Conversation replay projection test passed: ordered inert history, collapsed tools, orphan safety, statuses, and truncation metadata",
+  "Conversation replay projection test passed: ordered inert history, collapsed tools, duplicate suppression, orphan safety, statuses, and truncation metadata",
 );

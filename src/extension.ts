@@ -78,6 +78,7 @@ import {
   type SteeringInjection,
 } from "./steeringQueue";
 import { createRepeatedToolFailureMiddleware } from "./repeatedToolFailure";
+import { createRepeatedToolNonProgressMiddleware } from "./repeatedToolNonProgress";
 import {
   collectRuntimeDiagnostics,
   renderRuntimeDiagnostics,
@@ -372,6 +373,7 @@ interface ChatSession {
   executionMode: ExecutionMode;
   transcript: Array<{ role: "user" | "assistant"; content: string }>;
   allowedTools: Set<string>;
+  emittedToolResultIds: Set<string>;
 }
 
 type ConversationRunPhase =
@@ -888,6 +890,7 @@ class DeepAgentsChatPanel {
     let streamedFinalText = "";
     const adapter = new VsCodeChatModel({
       model,
+      seenToolResults: session.emittedToolResultIds,
       onPrompt: (snapshot) =>
         this.logModelPrompt(
           snapshot,
@@ -1114,6 +1117,7 @@ class DeepAgentsChatPanel {
       let streamedFinalText = "";
       const adapter = new VsCodeChatModel({
         model,
+        seenToolResults: session.emittedToolResultIds,
         onPrompt: (snapshot) =>
           this.logModelPrompt(
             snapshot,
@@ -1466,6 +1470,7 @@ class DeepAgentsChatPanel {
       }),
       middleware: [
         createRepeatedToolFailureMiddleware(),
+        createRepeatedToolNonProgressMiddleware(),
         createSubAgentMiddleware({
           defaultModel: adapter,
           subagents,
@@ -1554,7 +1559,7 @@ class DeepAgentsChatPanel {
     model: vscode.LanguageModelChat,
   ): void {
     this.modelCallsOutput.appendLine(
-      `[${new Date().toISOString()}] run=${runId} session=${session.id} agent=${agentId} model=${modelKey(model)}`,
+      `[${new Date().toISOString()}] run=${runId} session=${session.id} agent=${agentId}${snapshot.purpose === "compaction" ? ":compaction" : ""} model=${modelKey(model)}`,
     );
     this.modelCallsOutput.appendLine("===== SYSTEM PROMPT =====");
     this.modelCallsOutput.appendLine(snapshot.systemPrompt);
@@ -2474,6 +2479,7 @@ function createSession(
     executionMode: DEFAULT_EXECUTION_MODE,
     transcript: [],
     allowedTools: allowedToolsForSession(processInstanceId, stored.id),
+    emittedToolResultIds: new Set(),
   };
 }
 
@@ -2482,29 +2488,36 @@ function loadSessions(
   fallbackModelKey: string,
   processInstanceId: string,
 ): ChatSession[] {
-  return persistence.sessions.list().map((session) => ({
-    id: session.id,
-    threadId: session.threadId,
-    title: session.title,
-    selectedModelKey: session.selectedModelKey ?? fallbackModelKey,
-    selectedAgentId: session.selectedAgentId,
-    executionMode: DEFAULT_EXECUTION_MODE,
-    transcript: persistence.conversationEvents
-      .list(session.id)
-      .filter(
-        (event) =>
-          event.eventType === "user_message" ||
-          event.eventType === "assistant_message",
-      )
-      .map((event) => ({
-        role:
-          event.eventType === "user_message"
-            ? ("user" as const)
-            : ("assistant" as const),
-        content: String(event.payload.content),
-      })),
-    allowedTools: allowedToolsForSession(processInstanceId, session.id),
-  }));
+  return persistence.sessions.list().map((session) => {
+    const events = persistence.conversationEvents.list(session.id);
+    return {
+      id: session.id,
+      threadId: session.threadId,
+      title: session.title,
+      selectedModelKey: session.selectedModelKey ?? fallbackModelKey,
+      selectedAgentId: session.selectedAgentId,
+      executionMode: DEFAULT_EXECUTION_MODE,
+      transcript: events
+        .filter(
+          (event) =>
+            event.eventType === "user_message" ||
+            event.eventType === "assistant_message",
+        )
+        .map((event) => ({
+          role:
+            event.eventType === "user_message"
+              ? ("user" as const)
+              : ("assistant" as const),
+          content: String(event.payload.content),
+        })),
+      allowedTools: allowedToolsForSession(processInstanceId, session.id),
+      emittedToolResultIds: new Set(
+        events
+          .filter((event) => event.eventType === "tool_result")
+          .map((event) => String(event.payload.toolCallId)),
+      ),
+    };
+  });
 }
 
 function allowedToolsForSession(
@@ -3042,14 +3055,6 @@ function renderWebview(
               <button
                 class="execution-mode"
                 type="button"
-                data-mode="plan"
-                title="Plan mode will be available in the next implementation slice"
-                aria-pressed="false"
-                disabled
-              >Plan</button>
-              <button
-                class="execution-mode"
-                type="button"
                 data-mode="default"
                 title="Ask for approval before protected operations"
                 aria-pressed="true"
@@ -3531,7 +3536,7 @@ function renderWebview(
       agentSelect.disabled = value;
       modelSelect.disabled = value;
       for (const button of executionModeButtons) {
-        button.disabled = value || button.dataset.mode === "plan";
+        button.disabled = value;
       }
       if (!value) prompt.focus();
     }
