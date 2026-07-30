@@ -194,6 +194,39 @@ An interrupted run is classified on startup:
 
 Recovery never treats a historical **Allow for session** decision as current authority.
 
+### Storage, integrity, and backup
+
+The database is `deep-agents.sqlite` under the extension's workspace-specific `ExtensionContext.storageUri`. Its containing directory varies by operating system, VS Code distribution, profile, remote host, and workspace identity. This is local workspace state: it is not stored in the repository, synchronized between machines, or shared across workspaces. Checkpoints and tool output can contain prompts, source excerpts, command output, and other sensitive project data.
+
+Every open runs SQLite `PRAGMA quick_check` before migrations or application writes. A failed check stops persistence initialization and leaves the original file at the same path; Bridgit never deletes, resets, renames, copies, or repairs a corrupt database automatically. For a deeper manual diagnostic, close the Extension Host and run:
+
+```sh
+sqlite3 /path/to/deep-agents.sqlite "PRAGMA integrity_check;"
+```
+
+Prefer SQLite's online backup command for a transactionally consistent manual backup:
+
+```sh
+sqlite3 /path/to/deep-agents.sqlite ".backup '/path/to/deep-agents-backup.sqlite'"
+```
+
+For a portable SQL export:
+
+```sh
+sqlite3 /path/to/deep-agents.sqlite ".output /path/to/deep-agents-backup.sql" ".dump"
+```
+
+If the SQLite CLI is unavailable, close every Extension Host using that workspace before copying the database. Because the database uses WAL mode, copy `deep-agents.sqlite`, `deep-agents.sqlite-wal`, and `deep-agents.sqlite-shm` together if either sidecar exists. Restoring, replacing, or renaming database files is always a manual user action; preserve the original before attempting recovery.
+
+### Restart behavior and limits
+
+- A clean Extension Host reload reopens the same workspace database and restores persisted chat and audit history.
+- An interrupted attempt is recovered from LangGraph checkpoint state. Todo snapshots are diagnostic projections and are never used to reconstruct the graph.
+- Pending approvals are presented again before execution. Historical decisions remain visible, but **Allow for session** authority expires with the Extension Host process.
+- A tool that may have produced an external side effect before interruption is never retried silently. It requires an explicit mark-completed, warned retry, or abandon decision.
+- Recovery runs only when the workspace activates. Bridgit does not run while VS Code or the computer is off.
+- Automatic goal scheduling, background continuation, cross-workspace dashboards, and cloud synchronization remain deferred. The persistence schema can represent resumable goals, but it does not schedule them.
+
 ## Diagnostics
 
 The Command Palette exposes:

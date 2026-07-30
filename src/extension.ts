@@ -74,11 +74,16 @@ import {
   collectRuntimeDiagnostics,
   renderRuntimeDiagnostics,
 } from "./runtimeDiagnostics";
+import {
+  WorkspaceMutationCoordinator,
+  type MutationRunHooks,
+} from "./workspaceMutationCoordinator";
 
 let currentPanel: DeepAgentsChatPanel | undefined;
 const processAllowedTools = new Map<string, Set<string>>();
 const RUN_LEASE_MS = 30_000;
 const RUN_HEARTBEAT_MS = 10_000;
+const MAX_ACTIVE_CONVERSATIONS = 3;
 const INCLUDE_DEEPAGENTS_DEFAULT_SYSTEM_PROMPT = false;
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -359,6 +364,31 @@ interface ChatSession {
   allowedTools: Set<string>;
 }
 
+type ConversationRunPhase =
+  | "running"
+  | "waiting_mutation"
+  | "waiting_approval";
+
+interface PendingConversationApproval {
+  requestId: string;
+  allowSession: boolean;
+  actions: ApprovalAction[];
+  toolCallIds: string[];
+  resolve: (decision: ApprovalResolution) => void;
+}
+
+interface ConversationRunController {
+  runId: string;
+  sessionId: string;
+  cancellation: AbortController;
+  steeringQueue: SteeringQueue;
+  toolCalls: Map<string, { name: string; input: Record<string, unknown> }>;
+  phase: ConversationRunPhase;
+  liveDraft: string;
+  pendingApproval?: PendingConversationApproval;
+  expiredApprovalToolCallIds: Set<string>;
+}
+
 class DeepAgentsChatPanel {
   private readonly panel: vscode.WebviewPanel;
   private readonly disposables: vscode.Disposable[] = [];
@@ -370,27 +400,10 @@ class DeepAgentsChatPanel {
   private customizations: ProjectCustomizations;
   private agentRegistry: ProjectAgentRegistry;
   private readonly sessions: ChatSession[] = [];
-  private readonly toolCalls = new Map<
-    string,
-    { name: string; input: Record<string, unknown> }
-  >();
+  private readonly activeRuns = new Map<string, ConversationRunController>();
+  private readonly startingSessions = new Set<string>();
+  private readonly mutationCoordinator: WorkspaceMutationCoordinator;
   private currentSessionId: string;
-  private cancellation: AbortController | undefined;
-  private pendingApproval:
-    | {
-        requestId: string;
-        allowSession: boolean;
-        resolve: (decision: ApprovalDecision) => void;
-      }
-    | undefined;
-  private running = false;
-  private activeSteering:
-    | {
-        runId: string;
-        sessionId: string;
-        queue: SteeringQueue;
-      }
-    | undefined;
 
   constructor(
     context: vscode.ExtensionContext,
@@ -406,6 +419,7 @@ class DeepAgentsChatPanel {
     this.persistence = persistence;
     this.processInstanceId = processInstanceId;
     this.workspaceRoot = workspaceRoot;
+    this.mutationCoordinator = new WorkspaceMutationCoordinator(workspaceRoot);
     this.customizations = customizations;
     this.agentRegistry = new ProjectAgentRegistry(customizations);
     this.modelCallsOutput = modelCallsOutput;
@@ -434,8 +448,10 @@ class DeepAgentsChatPanel {
     );
     this.panel.onDidDispose(
       () => {
-        this.cancellation?.abort();
-        this.resolvePendingApproval("deny");
+        for (const run of this.activeRuns.values()) {
+          run.cancellation.abort();
+          this.resolvePendingApproval(run, "deny");
+        }
         for (const disposable of this.disposables) {
           disposable.dispose();
         }
@@ -459,9 +475,26 @@ class DeepAgentsChatPanel {
     );
   }
 
-  private get selectedModel(): vscode.LanguageModelChat {
+  private get activeRun(): ConversationRunController | undefined {
+    return this.activeRuns.get(this.activeSession.id);
+  }
+
+  private isSessionBusy(sessionId: string): boolean {
     return (
-      this.models.find((model) => modelKey(model) === this.selectedModelKey) ??
+      this.activeRuns.has(sessionId) ||
+      this.startingSessions.has(sessionId)
+    );
+  }
+
+  private get occupiedRunSlots(): number {
+    return this.activeRuns.size + this.startingSessions.size;
+  }
+
+  private modelForSession(session: ChatSession): vscode.LanguageModelChat {
+    return (
+      this.models.find(
+        (model) => modelKey(model) === session.selectedModelKey,
+      ) ??
       this.models[0]
     );
   }
@@ -522,30 +555,30 @@ class DeepAgentsChatPanel {
       return;
     }
     if (raw.type === "cancel") {
-      this.cancellation?.abort();
-      this.resolvePendingApproval("deny");
+      const run = this.activeRun;
+      run?.cancellation.abort();
+      if (run) {
+        this.resolvePendingApproval(run, "deny");
+      }
       return;
     }
     if (raw.type === "steer") {
-      const active = this.activeSteering;
+      const active = this.activeRun;
       const text = raw.text.trim();
-      if (
-        !this.running ||
-        !active ||
-        active.sessionId !== this.activeSession.id ||
-        !text
-      ) {
+      if (!active || !text) {
         await this.post({
           type: "steeringRejected",
+          sessionId: this.activeSession.id,
           requestId: raw.requestId,
           reason: "No active run can accept this steering message.",
         });
         return;
       }
-      const result = active.queue.enqueue(raw.requestId, text);
+      const result = active.steeringQueue.enqueue(raw.requestId, text);
       if (result.kind === "closed") {
         await this.post({
           type: "steeringRejected",
+          sessionId: active.sessionId,
           requestId: raw.requestId,
           reason: "The active run has already reached its final model boundary.",
         });
@@ -565,25 +598,48 @@ class DeepAgentsChatPanel {
       }
       await this.post({
         type: "steeringAccepted",
+        sessionId: active.sessionId,
         requestId: result.entry.id,
         text: result.entry.text,
       });
       return;
     }
     if (raw.type === "approval") {
-      if (this.pendingApproval?.requestId === raw.requestId) {
-        if (raw.decision === "session" && !this.pendingApproval.allowSession) {
+      const run = [...this.activeRuns.values()].find(
+        ({ pendingApproval }) =>
+          pendingApproval?.requestId === raw.requestId,
+      );
+      if (run?.pendingApproval) {
+        if (
+          raw.decision === "session" &&
+          !run.pendingApproval.allowSession
+        ) {
           return;
         }
-        this.resolvePendingApproval(raw.decision);
+        this.resolvePendingApproval(run, raw.decision);
       }
       return;
     }
-    if (raw.type === "resumePendingApproval" && !this.running) {
-      await this.resumePendingApproval(raw.runId);
+    if (
+      raw.type === "resumePendingApproval" &&
+      !this.isSessionBusy(this.activeSession.id) &&
+      this.occupiedRunSlots < MAX_ACTIVE_CONVERSATIONS
+    ) {
+      const session = this.activeSession;
+      this.startingSessions.add(session.id);
+      await this.postWorkbenchState(false);
+      try {
+        await this.resumePendingApproval(raw.runId, session);
+      } finally {
+        this.startingSessions.delete(session.id);
+        await this.postWorkbenchState(false);
+      }
       return;
     }
-    if (raw.type === "reconcileRecovery" && !this.running) {
+    if (
+      raw.type === "reconcileRecovery" &&
+      !this.isSessionBusy(this.activeSession.id)
+    ) {
       const recovery = this.persistence.recovery
         .listForSession(this.activeSession.id)
         .find((item) => item.run.id === raw.runId);
@@ -624,7 +680,10 @@ class DeepAgentsChatPanel {
       await this.postWorkbenchState(true);
       return;
     }
-    if (raw.type === "selectModel" && !this.running) {
+    if (
+      raw.type === "selectModel" &&
+      !this.isSessionBusy(this.activeSession.id)
+    ) {
       if (this.models.some((model) => modelKey(model) === raw.modelKey)) {
         this.activeSession.selectedModelKey = raw.modelKey;
         this.persistence.sessions.setModel(this.activeSession.id, raw.modelKey);
@@ -637,7 +696,10 @@ class DeepAgentsChatPanel {
       }
       return;
     }
-    if (raw.type === "selectAgent" && !this.running) {
+    if (
+      raw.type === "selectAgent" &&
+      !this.isSessionBusy(this.activeSession.id)
+    ) {
       const agentId = raw.agentId || null;
       if (
         agentId === null ||
@@ -651,7 +713,7 @@ class DeepAgentsChatPanel {
       }
       return;
     }
-    if (raw.type === "newSession" && !this.running) {
+    if (raw.type === "newSession") {
       const session = createSession(
         this.persistence,
         this.activeSession.selectedModelKey,
@@ -662,17 +724,17 @@ class DeepAgentsChatPanel {
       await this.postWorkbenchState(true);
       return;
     }
-    if (raw.type === "selectSession" && !this.running) {
+    if (raw.type === "selectSession") {
       if (this.sessions.some((session) => session.id === raw.sessionId)) {
         this.currentSessionId = raw.sessionId;
         await this.postWorkbenchState(true);
       }
       return;
     }
-    if (raw.type === "renameSession" && !this.running) {
+    if (raw.type === "renameSession") {
       const session = this.sessions.find((item) => item.id === raw.sessionId);
       const title = sanitizeManualTitle(raw.title);
-      if (session && title) {
+      if (session && title && !this.isSessionBusy(session.id)) {
         session.title = title;
         this.persistence.sessions.rename(session.id, title);
         this.persistence.conversationEvents.append({
@@ -684,9 +746,9 @@ class DeepAgentsChatPanel {
       }
       return;
     }
-    if (raw.type === "deleteSession" && !this.running) {
+    if (raw.type === "deleteSession") {
       const session = this.sessions.find((item) => item.id === raw.sessionId);
-      if (!session) {
+      if (!session || this.isSessionBusy(session.id)) {
         return;
       }
       const confirmation = await vscode.window.showWarningMessage(
@@ -701,7 +763,10 @@ class DeepAgentsChatPanel {
       await this.postWorkbenchState(true);
       return;
     }
-    if (raw.type === "clear" && !this.running) {
+    if (
+      raw.type === "clear" &&
+      !this.isSessionBusy(this.activeSession.id)
+    ) {
       this.persistence.sessions.clear(this.activeSession.id);
       const refreshed = this.persistence.sessions.get(this.activeSession.id);
       if (refreshed) this.activeSession.threadId = refreshed.threadId;
@@ -709,7 +774,10 @@ class DeepAgentsChatPanel {
       await this.postWorkbenchState(true);
       return;
     }
-    if (raw.type !== "send" || this.running) {
+    if (
+      raw.type !== "send" ||
+      this.isSessionBusy(this.activeSession.id)
+    ) {
       return;
     }
 
@@ -717,23 +785,43 @@ class DeepAgentsChatPanel {
     if (!prompt) {
       return;
     }
-    await this.run(prompt);
+    if (this.occupiedRunSlots >= MAX_ACTIVE_CONVERSATIONS) {
+      await this.post({
+        type: "runRejected",
+        sessionId: this.activeSession.id,
+        message:
+          "Three conversations are already active. Finish or cancel one before starting another.",
+      });
+      return;
+    }
+    const session = this.activeSession;
+    this.startingSessions.add(session.id);
+    await this.postWorkbenchState(false);
+    try {
+      await this.run(prompt, session);
+    } finally {
+      this.startingSessions.delete(session.id);
+      await this.postWorkbenchState(false);
+    }
   }
 
-  private async run(prompt: string): Promise<void> {
-    const selectedAgent = await this.resolveSelectedAgentForRun();
+  private async run(prompt: string, session: ChatSession): Promise<void> {
+    const selectedAgent = await this.resolveSelectedAgentForRun(session);
     if (!selectedAgent) {
       await this.post({
         type: "runFailed",
+        sessionId: session.id,
         message: "Select an agent before sending a message.",
       });
       return;
     }
-    this.running = true;
-    this.cancellation = new AbortController();
-    this.toolCalls.clear();
-    const session = this.activeSession;
-    const model = this.selectedModel;
+    if (
+      this.activeRuns.has(session.id) ||
+      this.activeRuns.size >= MAX_ACTIVE_CONVERSATIONS
+    ) {
+      return;
+    }
+    const model = this.modelForSession(session);
     const { runId, attemptId } = this.persistence.runs.start({
       sessionId: session.id,
       threadId: session.threadId,
@@ -743,15 +831,24 @@ class DeepAgentsChatPanel {
       leaseExpiresAt: leaseExpiration(),
       compatibilityVersion: CURRENT_GRAPH_COMPATIBILITY_VERSION,
     });
-    const steeringQueue = this.activateSteeringQueue(
+    const steeringQueue = new SteeringQueue();
+    const controller: ConversationRunController = {
       runId,
-      session.id,
-    );
+      sessionId: session.id,
+      cancellation: new AbortController(),
+      steeringQueue,
+      toolCalls: new Map(),
+      phase: "running",
+      liveDraft: "",
+      expiredApprovalToolCallIds: new Set(),
+    };
+    this.activeRuns.set(session.id, controller);
+    this.startingSessions.delete(session.id);
     const heartbeat = setInterval(() => {
       try {
         this.persistence.runs.heartbeat(attemptId, leaseExpiration());
       } catch {
-        this.cancellation?.abort();
+        controller.cancellation.abort();
       }
     }, RUN_HEARTBEAT_MS);
     heartbeat.unref();
@@ -768,7 +865,7 @@ class DeepAgentsChatPanel {
     if (isFirstMessage) {
       void this.generateSessionTitle(session.id, prompt, model);
     }
-    await this.post({ type: "runStarted" });
+    await this.post({ type: "runStarted", sessionId: session.id });
 
     let streamedFinalText = "";
     const adapter = new VsCodeChatModel({
@@ -784,8 +881,9 @@ class DeepAgentsChatPanel {
       onEvent: (event) => {
         if (event.kind === "text") {
           streamedFinalText += event.text;
+          controller.liveDraft += event.text;
         }
-        void this.postAdapterEvent(event, runId, session.id);
+        void this.postAdapterEvent(event, controller);
       },
     });
 
@@ -800,7 +898,7 @@ class DeepAgentsChatPanel {
     try {
       const runConfig = {
         configurable: { thread_id: session.threadId, checkpoint_ns: "" },
-        signal: this.cancellation.signal,
+        signal: controller.cancellation.signal,
       };
       let result = await agent.invoke(
         {
@@ -818,6 +916,7 @@ class DeepAgentsChatPanel {
             actions,
             runId,
             session,
+            controller,
           );
           const resume = { decisions };
           result = await agent.invoke(new Command({ resume }), runConfig);
@@ -846,7 +945,11 @@ class DeepAgentsChatPanel {
             payload: { schemaVersion: 1, content: intermediateText },
           });
         }
-        await this.post({ type: "modelBoundary" });
+        controller.liveDraft = "";
+        await this.post({
+          type: "modelBoundary",
+          sessionId: session.id,
+        });
         result = await agent.invoke({ messages: [] }, runConfig);
         await this.recordLatestCheckpoint(runId, session);
       }
@@ -862,12 +965,16 @@ class DeepAgentsChatPanel {
         payload: { schemaVersion: 1, content: finalText },
       });
       this.persistence.runs.finish(runId, attemptId, "completed");
-      await this.post({ type: "runCompleted", text: finalText });
+      await this.post({
+        type: "runCompleted",
+        sessionId: session.id,
+        text: finalText,
+      });
     } catch (error) {
-      const cancelled = this.cancellation.signal.aborted;
+      const cancelled = controller.cancellation.signal.aborted;
       const message = cancelled ? "Cancelled." : formatError(error);
       await this.discardSteeringQueue(
-        runId,
+        controller,
         cancelled ? "cancelled" : "failed",
       );
       session.transcript.push({ role: "assistant", content: message });
@@ -887,38 +994,42 @@ class DeepAgentsChatPanel {
       );
       await this.post({
         type: "runFailed",
+        sessionId: session.id,
         message,
       });
     } finally {
       clearInterval(heartbeat);
-      this.running = false;
-      this.cancellation = undefined;
-      this.clearSteeringQueue(runId);
+      this.mutationCoordinator.releaseRun(runId);
+      if (this.activeRuns.get(session.id) === controller) {
+        this.activeRuns.delete(session.id);
+      }
+      await this.postWorkbenchState(false);
     }
   }
 
-  private async resumePendingApproval(runId: string): Promise<void> {
-    const session = this.activeSession;
+  private async resumePendingApproval(
+    runId: string,
+    session: ChatSession,
+  ): Promise<void> {
     const recovery = this.persistence.recovery
       .listForSession(session.id)
       .find((item) => item.run.id === runId);
     if (!recovery || recovery.recoveryClass !== "waiting_for_approval") {
       return;
     }
-    const selectedAgent = await this.resolveSelectedAgentForRun();
+    const selectedAgent = await this.resolveSelectedAgentForRun(session);
     if (!selectedAgent) {
       await this.post({
         type: "runFailed",
+        sessionId: session.id,
         message: "Select the original agent before resuming this run.",
       });
       return;
     }
 
-    this.running = true;
-    this.cancellation = new AbortController();
-    this.toolCalls.clear();
     let attemptId: string | undefined;
     let heartbeat: NodeJS.Timeout | undefined;
+    let controller: ConversationRunController | undefined;
     try {
       const interrupts = await this.persistence.recovery.getPendingInterrupts(
         runId,
@@ -938,11 +1049,21 @@ class DeepAgentsChatPanel {
         leaseExpiresAt: leaseExpiration(),
         allowedRecoveryClasses: ["waiting_for_approval"],
       });
-      const steeringQueue = this.activateSteeringQueue(
-        runId,
-        session.id,
+      const steeringQueue = new SteeringQueue(
         this.restorePendingSteering(runId, session.id),
       );
+      controller = {
+        runId,
+        sessionId: session.id,
+        cancellation: new AbortController(),
+        steeringQueue,
+        toolCalls: new Map(),
+        phase: "running",
+        liveDraft: "",
+        expiredApprovalToolCallIds: new Set(),
+      };
+      this.activeRuns.set(session.id, controller);
+      this.startingSessions.delete(session.id);
       attemptId = resumed.attemptId;
       heartbeat = setInterval(() => {
         try {
@@ -951,13 +1072,13 @@ class DeepAgentsChatPanel {
             leaseExpiration(),
           );
         } catch {
-          this.cancellation?.abort();
+          controller?.cancellation.abort();
         }
       }, RUN_HEARTBEAT_MS);
       heartbeat.unref();
 
       for (const toolCall of this.persistence.toolExecutions.list(runId)) {
-        this.toolCalls.set(toolCall.toolCallId, {
+        controller.toolCalls.set(toolCall.toolCallId, {
           name: toolCall.toolName,
           input:
             toolCall.arguments && typeof toolCall.arguments === "object"
@@ -969,7 +1090,7 @@ class DeepAgentsChatPanel {
       const model =
         this.models.find(
           (candidate) => modelKey(candidate) === resumed.run.modelKey,
-        ) ?? this.selectedModel;
+        ) ?? this.modelForSession(session);
       let streamedFinalText = "";
       const adapter = new VsCodeChatModel({
         model,
@@ -984,8 +1105,9 @@ class DeepAgentsChatPanel {
         onEvent: (event) => {
           if (event.kind === "text") {
             streamedFinalText += event.text;
+            controller!.liveDraft += event.text;
           }
-          void this.postAdapterEvent(event, runId, session.id);
+          void this.postAdapterEvent(event, controller!);
         },
       });
       const agent = this.createAgent(
@@ -1000,10 +1122,13 @@ class DeepAgentsChatPanel {
           thread_id: resumed.run.threadId,
           checkpoint_ns: resumed.run.checkpointNamespace,
         },
-        signal: this.cancellation.signal,
+        signal: controller.cancellation.signal,
       };
 
-      await this.post({ type: "runStarted" });
+      await this.post({
+        type: "runStarted",
+        sessionId: session.id,
+      });
       const restoredRequestId = this.findPendingApprovalRequestId(
         session.id,
         runId,
@@ -1012,6 +1137,7 @@ class DeepAgentsChatPanel {
         approvalRequest.actions,
         runId,
         session,
+        controller,
         restoredRequestId
           ? { requestId: restoredRequestId, recordRequest: false }
           : {},
@@ -1030,6 +1156,7 @@ class DeepAgentsChatPanel {
             nextApproval.actions,
             runId,
             session,
+            controller,
           );
           result = await agent.invoke(
             new Command({ resume: { decisions: nextDecisions } }),
@@ -1060,7 +1187,11 @@ class DeepAgentsChatPanel {
             payload: { schemaVersion: 1, content: intermediateText },
           });
         }
-        await this.post({ type: "modelBoundary" });
+        controller.liveDraft = "";
+        await this.post({
+          type: "modelBoundary",
+          sessionId: session.id,
+        });
         result = await agent.invoke({ messages: [] }, runConfig);
         await this.recordLatestCheckpoint(runId, session);
       }
@@ -1084,15 +1215,20 @@ class DeepAgentsChatPanel {
         resumed.attemptId,
         "completed",
       );
-      await this.post({ type: "runCompleted", text: finalText });
-      await this.postWorkbenchState(true);
+      await this.post({
+        type: "runCompleted",
+        sessionId: session.id,
+        text: finalText,
+      });
     } catch (error) {
-      const cancelled = this.cancellation.signal.aborted;
+      const cancelled = controller?.cancellation.signal.aborted ?? false;
       const message = cancelled ? "Cancelled." : formatError(error);
-      await this.discardSteeringQueue(
-        runId,
-        cancelled ? "cancelled" : "failed",
-      );
+      if (controller) {
+        await this.discardSteeringQueue(
+          controller,
+          cancelled ? "cancelled" : "failed",
+        );
+      }
       if (attemptId) {
         session.transcript.push({ role: "assistant", content: message });
         this.persistence.conversationEvents.append({
@@ -1110,26 +1246,24 @@ class DeepAgentsChatPanel {
           message,
         );
       }
-      await this.post({ type: "runFailed", message });
-      await this.postWorkbenchState(true);
+      await this.post({
+        type: "runFailed",
+        sessionId: session.id,
+        message,
+      });
     } finally {
       if (heartbeat) {
         clearInterval(heartbeat);
       }
-      this.running = false;
-      this.cancellation = undefined;
-      this.clearSteeringQueue(runId);
+      this.mutationCoordinator.releaseRun(runId);
+      if (
+        controller &&
+        this.activeRuns.get(session.id) === controller
+      ) {
+        this.activeRuns.delete(session.id);
+      }
+      await this.postWorkbenchState(false);
     }
-  }
-
-  private activateSteeringQueue(
-    runId: string,
-    sessionId: string,
-    restoredEntries: readonly SteeringEntry[] = [],
-  ): SteeringQueue {
-    const queue = new SteeringQueue(restoredEntries);
-    this.activeSteering = { runId, sessionId, queue };
-    return queue;
   }
 
   private recordSteeringInjection(
@@ -1150,6 +1284,7 @@ class DeepAgentsChatPanel {
       });
       void this.post({
         type: "steeringInjected",
+        sessionId,
         requestId: entry.id,
         boundary: injection.boundary,
       });
@@ -1157,17 +1292,13 @@ class DeepAgentsChatPanel {
   }
 
   private async discardSteeringQueue(
-    runId: string,
+    run: ConversationRunController,
     reason: "cancelled" | "failed",
   ): Promise<void> {
-    const active = this.activeSteering;
-    if (!active || active.runId !== runId) {
-      return;
-    }
-    for (const entry of active.queue.discardPending()) {
+    for (const entry of run.steeringQueue.discardPending()) {
       this.persistence.conversationEvents.append({
-        sessionId: active.sessionId,
-        runId,
+        sessionId: run.sessionId,
+        runId: run.runId,
         eventType: "steering_discarded",
         payload: {
           schemaVersion: 1,
@@ -1177,6 +1308,7 @@ class DeepAgentsChatPanel {
       });
       await this.post({
         type: "steeringDiscarded",
+        sessionId: run.sessionId,
         requestId: entry.id,
         reason,
       });
@@ -1191,12 +1323,6 @@ class DeepAgentsChatPanel {
       this.persistence.conversationEvents.list(sessionId),
       runId,
     );
-  }
-
-  private clearSteeringQueue(runId: string): void {
-    if (this.activeSteering?.runId === runId) {
-      this.activeSteering = undefined;
-    }
   }
 
   private createAgent(
@@ -1243,6 +1369,12 @@ class DeepAgentsChatPanel {
     persistCheckpoints: boolean,
     steeringQueue: SteeringQueue | undefined,
   ) {
+    const runController = this.activeRuns.get(session.id);
+    if (!runController || runController.runId !== runId) {
+      throw new Error(
+        `Conversation run "${runId}" is not active for session "${session.id}".`,
+      );
+    }
     const configuredPolicy = resolveAgentToolPolicy(agentDefinition.tools, {
       mcpServerNames: Object.keys(this.customizations.mcp?.servers ?? {}),
     });
@@ -1327,6 +1459,10 @@ class DeepAgentsChatPanel {
           this.customizations.skills,
           this.workspaceRoot,
         ),
+        this.mutationCoordinator.createMiddleware({
+          runId,
+          hooks: this.mutationHooks(runController),
+        }),
         createToolExecutionLedgerMiddleware({
           repository: this.persistence.toolExecutions,
           runId,
@@ -1380,7 +1516,9 @@ class DeepAgentsChatPanel {
     this.modelCallsOutput.show(true);
   }
 
-  private async resolveSelectedAgentForRun(): Promise<
+  private async resolveSelectedAgentForRun(
+    session: ChatSession,
+  ): Promise<
     ProjectAgentDefinition | undefined
   > {
     this.customizations = await discoverProjectCustomizations(
@@ -1388,7 +1526,7 @@ class DeepAgentsChatPanel {
     );
     this.agentRegistry = new ProjectAgentRegistry(this.customizations);
     await this.postWorkbenchState(false);
-    const agent = this.agentRegistry.get(this.activeSession.selectedAgentId);
+    const agent = this.agentRegistry.get(session.selectedAgentId);
     return agent?.userInvocable ? agent : undefined;
   }
 
@@ -1396,19 +1534,11 @@ class DeepAgentsChatPanel {
     actions: ApprovalAction[],
     runId: string,
     session: ChatSession,
+    controller: ConversationRunController,
     presentation: ApprovalPresentation = {},
   ): Promise<GraphApprovalDecision[]> {
-    this.persistence.runs.setExecutionStatus(runId, "waiting_approval");
     await this.recordLatestCheckpoint(runId, session);
     const approvalToolCallIds = this.matchApprovalToolCalls(runId, actions);
-    for (const toolCallId of approvalToolCallIds) {
-      this.persistence.toolExecutions.transition(
-        runId,
-        toolCallId,
-        "waiting_approval",
-      );
-    }
-
     const commandGuardError = getCommandGuardError(
       actions,
       this.workspaceRoot,
@@ -1425,26 +1555,61 @@ class DeepAgentsChatPanel {
         ].join(" "),
       }));
     } else {
-      const decision = await this.requestApproval(
-        actions,
-        approvalToolCallIds,
+      const freshnessError = await this.mutationCoordinator.reserveApproval(
         runId,
-        session.id,
-        presentation,
+        actions.map((action, index) => ({
+          toolCallId: approvalToolCallIds[index],
+          name: action.name,
+          args: action.args,
+        })),
+        this.mutationHooks(controller),
       );
-      if (decision === "session") {
-        for (const action of actions) {
-          session.allowedTools.add(action.name);
+      if (freshnessError) {
+        decisions = actions.map(() => ({
+          type: "reject" as const,
+          message: freshnessError,
+        }));
+      } else {
+        this.persistence.runs.setExecutionStatus(runId, "waiting_approval");
+        this.setRunPhase(controller, "waiting_approval");
+        for (const toolCallId of approvalToolCallIds) {
+          this.persistence.toolExecutions.transition(
+            runId,
+            toolCallId,
+            "waiting_approval",
+          );
         }
+        const decision = await this.requestApproval(
+          actions,
+          approvalToolCallIds,
+          runId,
+          session.id,
+          controller,
+          presentation,
+        );
+        const approved = decision === "once" || decision === "session";
+        this.mutationCoordinator.resolveApproval(
+          runId,
+          approvalToolCallIds,
+          approved,
+        );
+        if (decision === "session") {
+          for (const action of actions) {
+            session.allowedTools.add(action.name);
+          }
+        }
+        decisions = actions.map(() =>
+          approved
+            ? { type: "approve" as const }
+            : {
+                type: "reject" as const,
+                message:
+                  decision === "expired"
+                    ? "The five-minute mutation approval reservation expired. Read the affected file again before proposing another edit."
+                    : "The user denied this tool operation for now.",
+              },
+        );
       }
-      decisions = actions.map(() =>
-        decision === "deny"
-          ? {
-              type: "reject" as const,
-              message: "The user denied this tool operation for now.",
-            }
-          : { type: "approve" as const },
-      );
     }
 
     decisions.forEach((decision, index) => {
@@ -1477,7 +1642,21 @@ class DeepAgentsChatPanel {
         );
       }
     });
+    this.setRunPhase(controller, "running");
     return decisions;
+  }
+
+  private mutationHooks(
+    controller: ConversationRunController,
+  ): MutationRunHooks {
+    return {
+      onWaiting: () =>
+        this.setRunPhase(controller, "waiting_mutation"),
+      onRunning: () =>
+        this.setRunPhase(controller, "running"),
+      onApprovalExpired: (toolCallId) =>
+        this.expireMutationApproval(controller, toolCallId),
+    };
   }
 
   private async requestApproval(
@@ -1485,8 +1664,9 @@ class DeepAgentsChatPanel {
     toolCallIds: string[],
     runId: string,
     sessionId: string,
+    controller: ConversationRunController,
     presentation: ApprovalPresentation = {},
-  ): Promise<ApprovalDecision> {
+  ): Promise<ApprovalResolution> {
     const requestId = presentation.requestId ?? crypto.randomUUID();
     const allowSession = actions.every(
       (action) =>
@@ -1494,11 +1674,18 @@ class DeepAgentsChatPanel {
         action.name === "edit_file" ||
         action.name === "execute_command",
     );
-    const decisionPromise = new Promise<ApprovalDecision>((resolve) => {
-      this.pendingApproval = { requestId, allowSession, resolve };
+    const decisionPromise = new Promise<ApprovalResolution>((resolve) => {
+      controller.pendingApproval = {
+        requestId,
+        allowSession,
+        actions,
+        toolCallIds,
+        resolve,
+      };
     });
     await this.post({
       type: "approvalRequested",
+      sessionId,
       requestId,
       actions,
       allowSession,
@@ -1521,29 +1708,70 @@ class DeepAgentsChatPanel {
         throw new Error(`Approval action "${action.name}" has no tool call.`);
       }
     });
+    if (
+      toolCallIds.some((toolCallId) =>
+        controller.expiredApprovalToolCallIds.has(toolCallId),
+      )
+    ) {
+      this.resolvePendingApproval(controller, "expired");
+    }
     const decision = await decisionPromise;
     await this.post({
       type: "approvalResolved",
+      sessionId,
       requestId,
-      decision,
+      decision: decision === "expired" ? "deny" : decision,
     });
+    this.setRunPhase(controller, "running");
     actions.forEach((action, index) => {
+      const persistedDecision =
+        decision === "expired" ? "deny" : decision;
       this.persistence.conversationEvents.append({
         sessionId,
         runId,
         eventType: "approval_resolved",
-        payload: { schemaVersion: 1, requestId, decision },
+        payload: {
+          schemaVersion: 1,
+          requestId,
+          decision: persistedDecision,
+        },
       });
       this.persistence.approvals.record({
         sessionId,
         runId,
         toolCallId: toolCallIds[index],
         toolName: action.name,
-        decision: decision === "deny" ? "deny" : decision,
+        decision: persistedDecision,
         processInstanceId: this.processInstanceId,
       });
     });
     return decision;
+  }
+
+  private setRunPhase(
+    controller: ConversationRunController,
+    phase: ConversationRunPhase,
+  ): void {
+    if (
+      this.activeRuns.get(controller.sessionId) !== controller ||
+      controller.phase === phase
+    ) {
+      return;
+    }
+    controller.phase = phase;
+    void this.postWorkbenchState(false);
+  }
+
+  private expireMutationApproval(
+    controller: ConversationRunController,
+    toolCallId: string,
+  ): void {
+    controller.expiredApprovalToolCallIds.add(toolCallId);
+    if (
+      controller.pendingApproval?.toolCallIds.includes(toolCallId)
+    ) {
+      this.resolvePendingApproval(controller, "expired");
+    }
   }
 
   private matchApprovalToolCalls(
@@ -1604,12 +1832,15 @@ class DeepAgentsChatPanel {
     }
   }
 
-  private resolvePendingApproval(decision: ApprovalDecision): void {
-    const pending = this.pendingApproval;
+  private resolvePendingApproval(
+    controller: ConversationRunController,
+    decision: ApprovalResolution,
+  ): void {
+    const pending = controller.pendingApproval;
     if (!pending) {
       return;
     }
-    this.pendingApproval = undefined;
+    controller.pendingApproval = undefined;
     pending.resolve(decision);
   }
 
@@ -1678,6 +1909,7 @@ class DeepAgentsChatPanel {
 
   private async postWorkbenchState(replaceMessages: boolean): Promise<void> {
     const active = this.activeSession;
+    const activeRun = this.activeRuns.get(active.id);
     const replayItems = replaceMessages
       ? prepareReplayItems(
           projectConversationEvents(
@@ -1690,6 +1922,17 @@ class DeepAgentsChatPanel {
       type: "workbenchState",
       replaceMessages,
       currentSessionId: active.id,
+      running: Boolean(activeRun) || this.startingSessions.has(active.id),
+      activeRunCount: this.occupiedRunSlots,
+      maxActiveConversations: MAX_ACTIVE_CONVERSATIONS,
+      liveDraft: activeRun?.liveDraft ?? "",
+      pendingApproval: activeRun?.pendingApproval
+        ? {
+            requestId: activeRun.pendingApproval.requestId,
+            actions: activeRun.pendingApproval.actions,
+            allowSession: activeRun.pendingApproval.allowSession,
+          }
+        : undefined,
       selectedModelKey: this.selectedModelKey,
       selectedAgentId: active.selectedAgentId,
       agents: this.agentRegistry.listUserInvocable().map((agent) => ({
@@ -1707,6 +1950,12 @@ class DeepAgentsChatPanel {
       sessions: this.sessions.map((session) => ({
         id: session.id,
         title: session.title,
+        activity:
+          this.activeRuns.get(session.id)?.phase === "waiting_approval"
+            ? "attention"
+            : this.isSessionBusy(session.id)
+              ? "running"
+              : "idle",
       })),
       recoveries: this.persistence.recovery.listForSession(active.id).map(
         (recovery) => ({
@@ -1723,14 +1972,19 @@ class DeepAgentsChatPanel {
 
   private async postAdapterEvent(
     event: AdapterEvent,
-    runId: string,
-    sessionId: string,
+    controller: ConversationRunController,
   ): Promise<void> {
+    const { runId, sessionId } = controller;
     if (event.kind === "text") {
-      await this.post({ type: "textDelta", text: event.text });
+      await this.post({
+        type: "textDelta",
+        sessionId,
+        text: event.text,
+      });
     } else if (event.kind === "toolCall") {
       const input = toRecord(event.input);
-      this.toolCalls.set(event.id, { name: event.name, input });
+      controller.liveDraft = "";
+      controller.toolCalls.set(event.id, { name: event.name, input });
       this.persistence.toolExecutions.request({
         runId,
         toolCallId: event.id,
@@ -1753,13 +2007,15 @@ class DeepAgentsChatPanel {
       });
       await this.post({
         type: "toolCall",
+        sessionId,
         id: event.id,
         name: event.name,
         input,
         label: describeToolActivity(event.name, input, "running"),
       });
     } else {
-      const toolCall = this.toolCalls.get(event.id);
+      controller.liveDraft = "";
+      const toolCall = controller.toolCalls.get(event.id);
       const outcome = event.text.trimStart().startsWith("Blocked")
         ? "blocked"
         : event.text.trimStart().startsWith("Error")
@@ -1783,6 +2039,7 @@ class DeepAgentsChatPanel {
       });
       await this.post({
         type: "toolResult",
+        sessionId,
         id: event.id,
         text: event.text.slice(0, 8_000),
         label: toolCall
@@ -1826,6 +2083,7 @@ type WebviewMessage =
   | { type: "resumePendingApproval"; runId: string };
 
 type ApprovalDecision = "once" | "session" | "deny";
+type ApprovalResolution = ApprovalDecision | "expired";
 type GraphApprovalDecision =
   | { type: "approve" }
   | { type: "reject"; message: string };
@@ -2302,6 +2560,36 @@ function renderWebview(
       white-space: nowrap;
       text-overflow: ellipsis;
       font-size: 12px;
+    }
+    .session-main {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+    }
+    .session-status {
+      width: 12px;
+      height: 12px;
+      flex: 0 0 12px;
+    }
+    .session-status.spinner {
+      border: 2px solid color-mix(in srgb, currentColor 28%, transparent);
+      border-top-color: currentColor;
+      border-radius: 50%;
+      animation: session-spin .75s linear infinite;
+    }
+    .session-status.attention {
+      display: grid;
+      place-items: center;
+      border-radius: 50%;
+      color: var(--vscode-notificationsWarningIcon-foreground, #cca700);
+      font-size: 12px;
+      font-weight: 800;
+    }
+    .session-status.attention::before { content: "!"; }
+    @keyframes session-spin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) {
+      .session-status.spinner { animation-duration: 1.8s; }
     }
     .session-controls { display: flex; opacity: 0; }
     .session-row:hover .session-controls,
@@ -2896,15 +3184,28 @@ function renderWebview(
         row.className = "session-row" + (session.id === currentSessionId ? " active" : "");
         row.title = session.title;
         row.addEventListener("click", () => {
-          if (!running && session.id !== currentSessionId) {
+          if (session.id !== currentSessionId) {
             vscode.postMessage({ type: "selectSession", sessionId: session.id });
           }
         });
 
+        const main = document.createElement("span");
+        main.className = "session-main";
+        if (session.activity !== "idle") {
+          const status = document.createElement("span");
+          status.className = "session-status " +
+            (session.activity === "attention" ? "attention" : "spinner");
+          status.title = session.activity === "attention"
+            ? "Approval required"
+            : "Agent is working";
+          status.setAttribute("aria-label", status.title);
+          main.appendChild(status);
+        }
         const name = document.createElement("span");
         name.className = "session-name";
         name.textContent = session.title;
-        row.appendChild(name);
+        main.appendChild(name);
+        row.appendChild(main);
 
         const controls = document.createElement("span");
         controls.className = "session-controls";
@@ -2913,20 +3214,20 @@ function renderWebview(
         rename.type = "button";
         rename.title = "Rename chat";
         rename.textContent = "✎";
-        rename.disabled = running;
+        rename.disabled = session.activity !== "idle";
         rename.addEventListener("click", (event) => {
           event.stopPropagation();
-          if (!running) beginRename(row, session);
+          if (session.activity === "idle") beginRename(row, session);
         });
         const remove = document.createElement("button");
         remove.className = "icon-button";
         remove.type = "button";
         remove.title = "Delete chat";
         remove.textContent = "×";
-        remove.disabled = running;
+        remove.disabled = session.activity !== "idle";
         remove.addEventListener("click", (event) => {
           event.stopPropagation();
-          if (!running) {
+          if (session.activity === "idle") {
             vscode.postMessage({ type: "deleteSession", sessionId: session.id });
           }
         });
@@ -2984,12 +3285,9 @@ function renderWebview(
       running = value;
       updateComposerControl();
       clear.disabled = value;
-      newChat.disabled = value;
+      newChat.disabled = false;
       agentSelect.disabled = value;
       modelSelect.disabled = value;
-      for (const button of sessionList.querySelectorAll("button")) {
-        button.disabled = value;
-      }
       if (!value) prompt.focus();
     }
 
@@ -3023,7 +3321,7 @@ function renderWebview(
     prompt.addEventListener("input", updateComposerControl);
     clear.addEventListener("click", () => vscode.postMessage({ type: "clear" }));
     newChat.addEventListener("click", () => {
-      if (!running) vscode.postMessage({ type: "newSession" });
+      vscode.postMessage({ type: "newSession" });
     });
     modelSelect.addEventListener("change", () => {
       if (!running) {
@@ -3044,28 +3342,44 @@ function renderWebview(
       switch (data.type) {
         case "workbenchState":
           currentSessionId = data.currentSessionId;
+          setRunning(data.running);
           renderSessions(data.sessions);
           renderAgents(data.agents, data.selectedAgentId);
           renderModels(data.models, data.selectedModelKey);
           if (data.replaceMessages) {
             replaceConversation(data.replayItems);
             renderRecoveries(data.recoveries);
+            if (data.liveDraft) {
+              draft = addMessage("assistant", data.liveDraft);
+            }
+            if (data.pendingApproval) {
+              addApproval(
+                data.pendingApproval.requestId,
+                data.pendingApproval.actions,
+                data.pendingApproval.allowSession,
+              );
+              draft = null;
+            }
           }
           break;
         case "runStarted":
+          if (data.sessionId !== currentSessionId) break;
           setRunning(true);
           draft = null;
           break;
         case "textDelta":
+          if (data.sessionId !== currentSessionId) break;
           if (!draft) draft = addMessage("assistant", "");
           draft.textContent += data.text;
           messages.scrollTop = messages.scrollHeight;
           break;
         case "toolCall":
+          if (data.sessionId !== currentSessionId) break;
           addActivity(data.id, data.label, JSON.stringify(data.input, null, 2));
           draft = null;
           break;
         case "toolResult":
+          if (data.sessionId !== currentSessionId) break;
           addActivity(data.id, data.label, data.text);
           // A tool result closes the current model/tool segment. The next text
           // belongs to a fresh model response (including parent text after a
@@ -3073,13 +3387,16 @@ function renderWebview(
           draft = null;
           break;
         case "approvalRequested":
+          if (data.sessionId !== currentSessionId) break;
           addApproval(data.requestId, data.actions, data.allowSession);
           draft = null;
           break;
         case "approvalResolved":
+          if (data.sessionId !== currentSessionId) break;
           resolveApproval(data.requestId, data.decision);
           break;
         case "steeringAccepted": {
+          if (data.sessionId !== currentSessionId) break;
           const submitted = pendingSteering.get(data.requestId);
           pendingSteering.delete(data.requestId);
           addSteeringMessage(data.requestId, data.text, "queued");
@@ -3090,28 +3407,38 @@ function renderWebview(
           break;
         }
         case "steeringInjected":
+          if (data.sessionId !== currentSessionId) break;
           addSteeringMessage(data.requestId, "", "injected");
           break;
         case "steeringDiscarded":
+          if (data.sessionId !== currentSessionId) break;
           addSteeringMessage(data.requestId, "", "discarded");
           break;
         case "steeringRejected":
+          if (data.sessionId !== currentSessionId) break;
           pendingSteering.delete(data.requestId);
           primaryAction.title = data.reason;
           primaryAction.setAttribute("aria-label", data.reason);
           break;
         case "modelBoundary":
+          if (data.sessionId !== currentSessionId) break;
           draft = null;
           break;
         case "runCompleted":
+          if (data.sessionId !== currentSessionId) break;
           if (!draft || draft.textContent !== data.text) addMessage("assistant", data.text);
           draft = null;
           setRunning(false);
           break;
         case "runFailed":
+          if (data.sessionId !== currentSessionId) break;
           addMessage("assistant", data.message);
           draft = null;
           setRunning(false);
+          break;
+        case "runRejected":
+          if (data.sessionId !== currentSessionId) break;
+          addMessage("assistant", data.message);
           break;
       }
     });

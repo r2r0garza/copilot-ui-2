@@ -2,7 +2,11 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { NodeSqliteSaver } from "./NodeSqliteSaver";
-import { configureDatabase, isoNow } from "./database";
+import {
+  assertDatabaseHealthy,
+  configureDatabase,
+  isoNow,
+} from "./database";
 import { applyMigrations } from "./migrations";
 import { ApprovalRepository } from "./ApprovalRepository";
 import { CheckpointCleanupRepository } from "./CheckpointCleanupRepository";
@@ -69,6 +73,7 @@ export class PersistenceService {
     const database = new DatabaseSync(databasePath);
 
     try {
+      assertDatabaseHealthy(database);
       configureDatabase(database);
       applyMigrations(database);
       const now = isoNow();
