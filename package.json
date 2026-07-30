@@ -73,12 +73,16 @@
     "@langchain/langgraph-checkpoint": "^1.1.3",
     "deepagents": "^1.0.0",
     "langchain": "^1.5.4",
+    "markdown-it": "^14.3.0",
+    "sanitize-html": "^2.17.6",
     "yaml": "^2.9.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@types/markdown-it": "^14.1.2",
     "@types/node": "^22.0.0",
+    "@types/sanitize-html": "^2.16.1",
     "@types/vscode": "1.105.0",
     "esbuild": "^0.25.0",
     "typescript": "^5.9.0"

@@ -78,6 +78,7 @@ import {
   WorkspaceMutationCoordinator,
   type MutationRunHooks,
 } from "./workspaceMutationCoordinator";
+import { renderMarkdown } from "./markdownRenderer";
 
 let currentPanel: DeepAgentsChatPanel | undefined;
 const processAllowedTools = new Map<string, Set<string>>();
@@ -969,6 +970,7 @@ class DeepAgentsChatPanel {
         type: "runCompleted",
         sessionId: session.id,
         text: finalText,
+        html: renderMarkdown(finalText),
       });
     } catch (error) {
       const cancelled = controller.cancellation.signal.aborted;
@@ -1219,6 +1221,7 @@ class DeepAgentsChatPanel {
         type: "runCompleted",
         sessionId: session.id,
         text: finalText,
+        html: renderMarkdown(finalText),
       });
     } catch (error) {
       const cancelled = controller?.cancellation.signal.aborted ?? false;
@@ -1915,6 +1918,10 @@ class DeepAgentsChatPanel {
           projectConversationEvents(
             this.persistence.conversationEvents.list(active.id),
           ),
+        ).map((item) =>
+          item.kind === "message" && item.role === "assistant"
+            ? { ...item, html: renderMarkdown(item.content) }
+            : item
         )
       : undefined;
     this.panel.title = active.title === "New chat" ? "Deep Agents Workbench" : active.title;
@@ -1926,6 +1933,9 @@ class DeepAgentsChatPanel {
       activeRunCount: this.occupiedRunSlots,
       maxActiveConversations: MAX_ACTIVE_CONVERSATIONS,
       liveDraft: activeRun?.liveDraft ?? "",
+      liveDraftHtml: activeRun?.liveDraft
+        ? renderMarkdown(activeRun.liveDraft)
+        : "",
       pendingApproval: activeRun?.pendingApproval
         ? {
             requestId: activeRun.pendingApproval.requestId,
@@ -1980,6 +1990,8 @@ class DeepAgentsChatPanel {
         type: "textDelta",
         sessionId,
         text: event.text,
+        content: controller.liveDraft,
+        html: renderMarkdown(controller.liveDraft),
       });
     } else if (event.kind === "toolCall") {
       const input = toRecord(event.input);
@@ -2674,6 +2686,69 @@ function renderWebview(
       overflow-wrap: anywhere;
       line-height: 1.45;
     }
+    .message.markdown {
+      white-space: normal;
+    }
+    .message.markdown > :first-child { margin-top: 0; }
+    .message.markdown > :last-child { margin-bottom: 0; }
+    .message.markdown p { margin: 0 0 .75em; }
+    .message.markdown h1,
+    .message.markdown h2,
+    .message.markdown h3,
+    .message.markdown h4,
+    .message.markdown h5,
+    .message.markdown h6 {
+      margin: 1em 0 .45em;
+      line-height: 1.25;
+    }
+    .message.markdown h1 { font-size: 1.5em; }
+    .message.markdown h2 { font-size: 1.3em; }
+    .message.markdown h3 { font-size: 1.15em; }
+    .message.markdown ul,
+    .message.markdown ol {
+      margin: .35em 0 .8em;
+      padding-left: 1.75em;
+    }
+    .message.markdown li + li { margin-top: .25em; }
+    .message.markdown pre {
+      max-width: 100%;
+      margin: .65em 0;
+      padding: 9px 10px;
+      overflow: auto;
+      white-space: pre;
+      background: var(--vscode-textCodeBlock-background);
+      border: 1px solid var(--vscode-widget-border);
+      border-radius: 4px;
+    }
+    .message.markdown code {
+      font-family: var(--vscode-editor-font-family);
+      font-size: .92em;
+    }
+    .message.markdown :not(pre) > code {
+      padding: .1em .3em;
+      background: var(--vscode-textCodeBlock-background);
+      border-radius: 3px;
+    }
+    .message.markdown blockquote {
+      margin: .65em 0;
+      padding-left: .85em;
+      color: var(--vscode-descriptionForeground);
+      border-left: 3px solid var(--vscode-textBlockQuote-border);
+    }
+    .message.markdown a {
+      color: var(--vscode-textLink-foreground);
+    }
+    .message.markdown table {
+      display: block;
+      max-width: 100%;
+      overflow: auto;
+      border-collapse: collapse;
+    }
+    .message.markdown th,
+    .message.markdown td {
+      padding: 5px 8px;
+      border: 1px solid var(--vscode-widget-border);
+    }
     .user {
       align-self: flex-end;
       background: var(--vscode-button-background);
@@ -2885,11 +2960,22 @@ function renderWebview(
       return state;
     }
 
-    function addMessage(role, text) {
+    function setMessageContent(element, role, text, html) {
+      element.dataset.rawText = text;
+      if (role === "assistant" && typeof html === "string") {
+        element.classList.add("markdown");
+        element.innerHTML = html;
+      } else {
+        element.classList.remove("markdown");
+        element.textContent = text;
+      }
+    }
+
+    function addMessage(role, text, html) {
       document.getElementById("empty")?.remove();
       const element = document.createElement("div");
       element.className = "message " + role;
-      element.textContent = text;
+      setMessageContent(element, role, text, html);
       messages.appendChild(element);
       messages.scrollTop = messages.scrollHeight;
       return element;
@@ -3044,7 +3130,7 @@ function renderWebview(
       }
       for (const item of replayItems) {
         if (item.kind === "message") {
-          addMessage(item.role, item.content);
+          addMessage(item.role, item.content, item.html);
         } else if (item.kind === "steering_message") {
           addSteeringMessage(item.steeringId, item.content, item.status);
         } else if (item.kind === "tool_call") {
@@ -3350,7 +3436,11 @@ function renderWebview(
             replaceConversation(data.replayItems);
             renderRecoveries(data.recoveries);
             if (data.liveDraft) {
-              draft = addMessage("assistant", data.liveDraft);
+              draft = addMessage(
+                "assistant",
+                data.liveDraft,
+                data.liveDraftHtml,
+              );
             }
             if (data.pendingApproval) {
               addApproval(
@@ -3369,8 +3459,8 @@ function renderWebview(
           break;
         case "textDelta":
           if (data.sessionId !== currentSessionId) break;
-          if (!draft) draft = addMessage("assistant", "");
-          draft.textContent += data.text;
+          if (!draft) draft = addMessage("assistant", "", "");
+          setMessageContent(draft, "assistant", data.content, data.html);
           messages.scrollTop = messages.scrollHeight;
           break;
         case "toolCall":
@@ -3426,7 +3516,11 @@ function renderWebview(
           break;
         case "runCompleted":
           if (data.sessionId !== currentSessionId) break;
-          if (!draft || draft.textContent !== data.text) addMessage("assistant", data.text);
+          if (!draft || draft.dataset.rawText !== data.text) {
+            addMessage("assistant", data.text, data.html);
+          } else {
+            setMessageContent(draft, "assistant", data.text, data.html);
+          }
           draft = null;
           setRunning(false);
           break;

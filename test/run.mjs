@@ -19,6 +19,7 @@ const tests = [
   "runtimeDiagnostics.test",
   "vscodeToolAdapter.integration",
   "mcpFixture.integration",
+  "markdownRenderer.test",
   "vscodeMcpTools.integration",
   "vscodeWebBrowserTools.integration",
   "command.integration",
